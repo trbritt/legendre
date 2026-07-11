@@ -64,14 +64,14 @@ fn build_state(grid: &CartesianGrid<2>) -> (DenseState, FieldHandle<f64>, FieldH
             let mut v = state.view_mut(grid, block, phi);
             for_each_interior(grid.block_cells(), |idx| {
                 let [x, y] = grid.cell_center(block, idx);
-                v.set(idx, 100.0 * x + y);
+                v.set(idx, 100.0f64.mul_add(x, y));
             });
         }
         {
             let mut v = state.view_mut(grid, block, theta);
             for_each_interior(grid.block_cells(), |idx| {
                 let [x, y] = grid.cell_center(block, idx);
-                v.set(idx, -(x + 1000.0 * y));
+                v.set(idx, -1000.0f64.mul_add(y, x));
             });
         }
     }
