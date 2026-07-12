@@ -1,5 +1,6 @@
 # legendre
 
+[![CI](https://github.com/trbritt/legendre/actions/workflows/ci.yml/badge.svg)](https://github.com/trbritt/legendre/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/legendre.svg)](https://crates.io/crates/legendre)
 [![docs.rs](https://docs.rs/legendre/badge.svg)](https://docs.rs/legendre)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
