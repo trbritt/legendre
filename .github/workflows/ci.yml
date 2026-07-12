@@ -36,8 +36,11 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             rustflags: -D warnings
+          # GitHub retired Intel macOS runners (macos-13 was the last);
+          # keep x86_64-apple-darwin coverage as a cross-target check on
+          # the ARM runner — clippy type-checks without executing binaries.
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             rustflags: -D warnings
           - target: aarch64-apple-darwin
             os: macos-latest
