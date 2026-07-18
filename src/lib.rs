@@ -35,8 +35,8 @@
 //! ├── State            (Storage + field views, ghost-inclusive slabs)
 //! ├── Grid             (topology: blocks, indices, views)
 //! ├── Discretization   (policy: builds Stencils for Operators)
-//! ├── Model            (mathematics: rhs, never mutates state)
-//! ├── Integrator       (advances State using Model::rhs)
+//! ├── Model            (mathematics: driver-indexed vector fields)
+//! ├── Integrator       (advances State using Model::vector_field_block)
 //! └── Observers        (async output; never block the solver)
 //! ```
 //!
@@ -60,7 +60,7 @@
 //! };
 //! use legendre::geometry::cartesian::{CartesianGrid, fill_ghosts_mirror, for_each_interior};
 //! use legendre::integrators::ForwardEuler;
-//! use legendre::physics::model::{Model, RhsContext};
+//! use legendre::physics::model::{Driver, Model, NoNoise, RhsContext};
 //!
 //! struct Heat<const D: usize> {
 //!     kappa: f64,
@@ -72,6 +72,7 @@
 //!     P: Discretizes<CartesianGrid<D>, Laplacian>,
 //! {
 //!     type Scalar = f64;
+//!     type Noise = NoNoise; // deterministic: time is the only driver
 //!
 //!     fn register_fields(&mut self, builder: &mut StateBuilder<f64>) {
 //!         self.u = Some(builder.register("u", 1)); // name + ghost width
@@ -86,8 +87,9 @@
 //!         fill_ghosts_mirror(grid, state, self.u.unwrap());
 //!     }
 //!
-//!     fn rhs_block<S: StorageBackend<f64>>(
+//!     fn vector_field_block<S: StorageBackend<f64>>(
 //!         &self,
+//!         _driver: Driver, // NoNoise models only ever see Driver::Time
 //!         ctx: &RhsContext<'_, CartesianGrid<D>, P>,
 //!         state: &State<f64, S>,
 //!         out: &mut BlockStateMut<'_, f64, S>,

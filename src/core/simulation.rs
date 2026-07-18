@@ -26,7 +26,7 @@ pub struct Simulation<G, D, M, I, Sch, A>
 where
     G: Grid,
     M: Model<G, D>,
-    I: Integrator<G, D>,
+    I: Integrator<G, D, M::Noise>,
     Sch: Scheduler,
     A: Allocator<M::Scalar>,
 {
@@ -48,7 +48,7 @@ impl<G, D, M, I, Sch, A> Simulation<G, D, M, I, Sch, A>
 where
     G: Grid,
     M: Model<G, D>,
-    I: Integrator<G, D>,
+    I: Integrator<G, D, M::Noise>,
     Sch: Scheduler,
     A: Allocator<M::Scalar>,
 {

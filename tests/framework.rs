@@ -192,7 +192,7 @@ mod state_ops {
         amp.slab_mut(BlockId(0), dynamic).fill(1.0);
         let before_static: Vec<f64> = state.slab(BlockId(0), static_f).to_vec();
         let before_dynamic: Vec<f64> = state.slab(BlockId(0), dynamic).to_vec();
-        state.add_noise(&amp, 1.0, 42, 0);
+        state.add_wiener(&grid, &amp, 1.0, 42, 0, 0);
         assert_eq!(
             state.slab(BlockId(0), static_f),
             &before_static[..],
@@ -210,9 +210,57 @@ mod state_ops {
         let (grid, mut state, dynamic, _) = two_field_state();
         let amp = state.like_tendency(&grid, &SystemAllocator); // all zero
         let before: Vec<f64> = state.slab(BlockId(0), dynamic).to_vec();
-        state.add_noise(&amp, 1.0, 42, 0);
+        state.add_wiener(&grid, &amp, 1.0, 42, 0, 0);
         assert_eq!(state.slab(BlockId(0), dynamic), &before[..]);
-        let _ = grid;
+    }
+
+    /// The driver-broadcast contract: one Wiener increment per (cell,
+    /// driver), identical across every field the driver moves — even when
+    /// the fields' slab layouts differ (different ghost widths) — and
+    /// ghost entries never receive noise. Distinct drivers use distinct
+    /// increment streams.
+    #[test]
+    fn wiener_increments_broadcast_per_cell_across_fields() {
+        let grid = CartesianGrid::new([4], [4], [0.0], [1.0]).unwrap();
+        let mut builder = StateBuilder::<f64>::new();
+        let a = builder.register("a", 0);
+        let b = builder.register("b", 2); // different ghost width than a
+        let mut state: DenseState = builder.build(&grid, &SystemAllocator);
+
+        // Unit amplitude everywhere, ghost entries of b included: the
+        // cell-key gate (not the zero-amplitude gate) must keep ghosts
+        // noise-free.
+        let mut amp = state.like_tendency(&grid, &SystemAllocator);
+        amp.slab_mut(BlockId(0), a).fill(1.0);
+        amp.slab_mut(BlockId(0), b).fill(1.0);
+
+        state.add_wiener(&grid, &amp, 1.0, 42, 3, 0);
+        let va = state.view(&grid, BlockId(0), a);
+        let vb = state.view(&grid, BlockId(0), b);
+        for_each_interior([4], |idx| {
+            assert_ne!(va.get(idx), 0.0, "interior cells receive noise");
+            assert_eq!(
+                va.get(idx),
+                vb.get(idx),
+                "same driver, same cell ⇒ same increment on every field"
+            );
+        });
+        for k in [-2isize, -1, 4, 5] {
+            assert_eq!(vb.get([k]), 0.0, "ghost entries receive no noise");
+        }
+
+        // A different driver index draws from a different stream.
+        let mut other = state.like(&grid, &SystemAllocator);
+        other.fill_zero();
+        other.add_wiener(&grid, &amp, 1.0, 42, 3, 1);
+        let vo = other.view(&grid, BlockId(0), a);
+        let mut all_equal = true;
+        for_each_interior([4], |idx| {
+            if vo.get(idx) != va.get(idx) {
+                all_equal = false;
+            }
+        });
+        assert!(!all_equal, "drivers must have independent streams");
     }
 
     #[test]

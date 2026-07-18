@@ -16,7 +16,7 @@ use legendre::{
     },
     geometry::{cartesian::CartesianGrid, grid::BlockId},
     integrators::{EulerMaruyama, ForwardEuler, Integrator, RungeKutta4},
-    physics::model::{Model, RhsContext},
+    physics::model::{Driver, Model, NoNoise, RhsContext},
 };
 
 struct Cubic {
@@ -25,13 +25,15 @@ struct Cubic {
 
 impl<D: Sync> Model<CartesianGrid<1>, D> for Cubic {
     type Scalar = f64;
+    type Noise = NoNoise;
 
     fn register_fields(&mut self, builder: &mut StateBuilder<f64>) {
         self.u = Some(builder.register("u", 0)); // no stencil, no ghosts
     }
 
-    fn rhs_block<S: StorageBackend<f64>>(
+    fn vector_field_block<S: StorageBackend<f64>>(
         &self,
+        _driver: Driver,
         ctx: &RhsContext<'_, CartesianGrid<1>, D>,
         state: &State<f64, S>,
         out: &mut BlockStateMut<'_, f64, S>,
@@ -44,7 +46,7 @@ impl<D: Sync> Model<CartesianGrid<1>, D> for Cubic {
     }
 }
 
-fn run<I: Integrator<CartesianGrid<1>, ()>>(integrator: I, dt: f64, t_end: f64) -> f64 {
+fn run<I: Integrator<CartesianGrid<1>, (), NoNoise>>(integrator: I, dt: f64, t_end: f64) -> f64 {
     let grid = CartesianGrid::new([1], [1], [0.0], [1.0]).unwrap();
     let mut sim = Simulation::new(
         grid,
@@ -67,14 +69,14 @@ fn run<I: Integrator<CartesianGrid<1>, ()>>(integrator: I, dt: f64, t_end: f64) 
     sim.state().view(sim.grid(), BlockId(0), u).get([0])
 }
 
-fn error(integrator: impl Integrator<CartesianGrid<1>, ()>, dt: f64) -> f64 {
+fn error(integrator: impl Integrator<CartesianGrid<1>, (), NoNoise>, dt: f64) -> f64 {
     const T_END: f64 = 0.5;
     let exact = 1.0 / 2.0f64.mul_add(T_END, 1.0).sqrt();
     (run(integrator, dt, T_END) - exact).abs()
 }
 
 /// Observed order p from halving dt: p = log2(e(dt)/e(dt/2)).
-fn observed_order(integrator: impl Integrator<CartesianGrid<1>, ()> + Copy, dt: f64) -> f64 {
+fn observed_order(integrator: impl Integrator<CartesianGrid<1>, (), NoNoise> + Copy, dt: f64) -> f64 {
     (error(integrator, dt) / error(integrator, dt / 2.0)).log2()
 }
 
@@ -86,7 +88,7 @@ fn forward_euler_is_first_order() {
 
 #[test]
 fn rk4_is_fourth_order() {
-    let p = observed_order(RungeKutta4::default(), 0.02);
+    let p = observed_order(RungeKutta4, 0.02);
     assert!((3.7..4.3).contains(&p), "expected order ≈ 4, got {p}");
 }
 

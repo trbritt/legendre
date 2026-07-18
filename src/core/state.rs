@@ -376,24 +376,37 @@ fn block_copy<T: Real, S: StorageBackend<T>>(
     }
 }
 
-fn block_add_noise<T: Real, S: StorageBackend<T>>(
+#[allow(clippy::too_many_arguments)]
+fn block_add_wiener<T: Real, S: StorageBackend<T>, G: Grid>(
+    grid: &G,
+    layout: &StateLayout,
     mine: &mut BlockStorage<T, S>,
     amp: &BlockStorage<T, S>,
-    block: usize,
+    block: BlockId,
     scale: T,
     seed: u64,
     salt: u64,
+    driver: usize,
 ) {
+    // One key stream per (seed, salt, driver, block); the per-cell id from
+    // Grid::cell_key is ghost-independent, so every field the driver moves
+    // receives the *same* deviate at the same cell — the broadcast that
+    // makes correlated multi-component dynamics expressible.
+    let block_key =
+        crate::util::rng::mix_key(seed, &[salt, driver as u64, block.index() as u64]);
     for (f, (x, a)) in mine.fields.iter_mut().zip(&amp.fields).enumerate() {
         if x.is_empty() || a.is_empty() {
             continue; // static field paired with a tendency buffer
         }
-        let block_field_key = crate::util::rng::mix_key(seed, &[salt, block as u64, f as u64]);
+        let ghost = layout.ghost(f);
         for (i, (xi, ai)) in x.as_mut_slice().iter_mut().zip(a.as_slice()).enumerate() {
             if *ai == T::ZERO {
                 continue;
             }
-            let key = crate::util::rng::splitmix64(block_field_key ^ i as u64);
+            let Some(cell) = grid.cell_key(block, ghost, i) else {
+                continue; // ghost entry: never receives noise
+            };
+            let key = crate::util::rng::splitmix64(block_key ^ cell);
             let noise = T::from_f64(crate::util::rng::standard_normal(key));
             *xi += scale * *ai * noise;
         }
@@ -466,41 +479,68 @@ impl<T: Real, S: StorageBackend<T>> State<T, S> {
         );
     }
 
-    /// `self += scale · amplitude ∘ ξ`, where ξ is a standard normal drawn
-    /// per entry from the counter-based generator keyed by
-    /// `(seed, salt, block, field, slab offset)` — deterministic and
-    /// schedule-independent (see [`crate::util::rng`]). Entries with zero
-    /// amplitude are skipped, so ghost cells of a zeroed amplitude buffer
-    /// cost nothing and receive no noise.
-    pub fn add_noise(&mut self, amplitude: &Self, scale: T, seed: u64, salt: u64) {
-        debug_assert!(Arc::ptr_eq(&self.layout, &amplitude.layout));
-        for (b, (mine, amp)) in self.blocks.iter_mut().zip(&amplitude.blocks).enumerate() {
-            block_add_noise(mine, amp, b, scale, seed, salt);
-        }
-    }
-
-    /// Scheduler-driven [`State::add_noise`]; identical results under any
-    /// scheduling because keys depend only on (block, field, offset).
-    pub fn add_noise_with<Sch: Scheduler>(
+    /// `self += scale · amplitude ∘ ξ` for one Wiener driver, where ξ is a
+    /// standard normal drawn per *cell* from the counter-based generator
+    /// keyed by `(seed, salt, driver, block, cell)` — deterministic and
+    /// schedule-independent (see [`crate::util::rng`]). The cell id comes
+    /// from [`Grid::cell_key`], so all fields moved by the driver receive
+    /// the same deviate at the same cell (the broadcast correlated systems
+    /// rely on). Zero-amplitude entries are skipped and ghost entries never
+    /// receive noise.
+    pub fn add_wiener<G: Grid>(
         &mut self,
-        scheduler: &Sch,
+        grid: &G,
         amplitude: &Self,
         scale: T,
         seed: u64,
         salt: u64,
+        driver: usize,
     ) {
         debug_assert!(Arc::ptr_eq(&self.layout, &amplitude.layout));
+        for (b, (mine, amp)) in self.blocks.iter_mut().zip(&amplitude.blocks).enumerate() {
+            block_add_wiener(
+                grid,
+                &self.layout,
+                mine,
+                amp,
+                BlockId(b as u32),
+                scale,
+                seed,
+                salt,
+                driver,
+            );
+        }
+    }
+
+    /// Scheduler-driven [`State::add_wiener`]; identical results under any
+    /// scheduling because keys depend only on (driver, block, cell).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_wiener_with<G: Grid, Sch: Scheduler>(
+        &mut self,
+        scheduler: &Sch,
+        grid: &G,
+        amplitude: &Self,
+        scale: T,
+        seed: u64,
+        salt: u64,
+        driver: usize,
+    ) {
+        debug_assert!(Arc::ptr_eq(&self.layout, &amplitude.layout));
+        let layout = &self.layout;
         scheduler.for_each_block_mut(
             &mut self.blocks,
             || (),
             |id, mine, ()| {
-                block_add_noise(
+                block_add_wiener(
+                    grid,
+                    layout,
                     mine,
                     &amplitude.blocks[id.index()],
-                    id.index(),
+                    id,
                     scale,
                     seed,
                     salt,
+                    driver,
                 );
             },
         );

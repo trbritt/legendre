@@ -14,7 +14,10 @@ use legendre::{
         grid::{BlockId, Grid},
     },
     integrators::EulerMaruyama,
-    physics::phasefield::ModelC,
+    physics::{
+        model::{NoNoise, Wiener},
+        phasefield::ModelC,
+    },
 };
 
 const N: usize = 64;
@@ -26,7 +29,7 @@ fn run_model_c<Sch: Scheduler>(
     steps: usize,
 ) -> (Vec<f64>, Vec<f64>) {
     let grid = CartesianGrid::new([N, N], [N / 2, N / 2], [0.0, 0.0], [H, H]).unwrap();
-    let mut model = ModelC::classic();
+    let mut model = ModelC::<Wiener<1>>::classic();
     model.noise_amplitude = noise_amplitude;
 
     let mut sim = Simulation::new(
@@ -140,7 +143,7 @@ mod async_pipeline {
     #[test]
     fn async_observer_delivers_and_drains() {
         let grid = CartesianGrid::new([N, N], [N / 2, N / 2], [0.0, 0.0], [H, H]).unwrap();
-        let model = ModelC::classic();
+        let model = ModelC::<NoNoise>::classic();
         let mut sim = Simulation::new(
             grid,
             FiniteVolume::default(),
@@ -189,7 +192,7 @@ mod orientations {
     fn run_oriented(theta0: f64, steps: usize) -> Vec<(f64, f64)> {
         const M: usize = 96;
         let grid = CartesianGrid::new([M, M], [M / 2, M / 2], [0.0, 0.0], [H, H]).unwrap();
-        let model = ModelC::classic().with_orientations();
+        let model = ModelC::<NoNoise>::classic().with_orientations();
         let mut sim = Simulation::new(
             grid,
             FiniteVolume::default(),
@@ -288,15 +291,16 @@ mod orientations {
         // RK4's y_tmp is a stage-*state* buffer: it must carry theta0 so the
         // model can read it during intermediate stages (tendency buffers
         // don't). A crash or NaN here means the stage layout is wrong.
+        // (RK4 is deterministic-only under the driver contract, so this
+        // runs the NoNoise instantiation.)
         use legendre::integrators::RungeKutta4;
         let grid = CartesianGrid::new([N, N], [N / 2, N / 2], [0.0, 0.0], [H, H]).unwrap();
-        let mut model = ModelC::classic().with_orientations();
-        model.noise_amplitude = 0.05;
+        let model = ModelC::<NoNoise>::classic().with_orientations();
         let mut sim = Simulation::new(
             grid,
             FiniteVolume::default(),
             model,
-            RungeKutta4 { seed: 7 },
+            RungeKutta4,
             RayonScheduler,
             SystemAllocator,
         );
@@ -339,7 +343,7 @@ mod orientations {
         let (phi_legacy, u_legacy) = run_model_c(SerialScheduler, 0.0, 300);
 
         let grid = CartesianGrid::new([N, N], [N / 2, N / 2], [0.0, 0.0], [H, H]).unwrap();
-        let model = ModelC::classic().with_orientations();
+        let model = ModelC::<Wiener<1>>::classic().with_orientations();
         let mut sim = Simulation::new(
             grid,
             FiniteVolume::default(),

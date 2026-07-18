@@ -85,6 +85,18 @@ pub trait Grid: Send + Sync + 'static {
     /// Physical coordinates of a cell center.
     fn cell_center(&self, block: BlockId, idx: Self::Index) -> Self::Point;
 
+    /// Canonical id of the *interior* cell at slab `offset` of a field
+    /// stored with ghost width `ghost` on `block`, or `None` if the offset
+    /// is a ghost entry.
+    ///
+    /// The id is a pure function of the cell's position within the block —
+    /// independent of `ghost` — so every field of a block shares one id per
+    /// cell even when their slab layouts differ. This is the key the
+    /// per-cell noise broadcast is built on: one Wiener increment per
+    /// (block, cell, driver, step), identical for every field the driver
+    /// moves (see [`crate::core::state::State::add_wiener`]).
+    fn cell_key(&self, block: BlockId, ghost: u32, offset: usize) -> Option<u64>;
+
     /// Wrap one block's raw slab in a typed read view.
     ///
     /// `data` must be exactly `block_len(block, ghost)` long; implementations

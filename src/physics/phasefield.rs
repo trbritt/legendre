@@ -33,8 +33,9 @@ use crate::{
         cartesian::{CartesianGrid, fill_ghosts_mirror, for_each_interior},
         grid::{BlockId, Grid},
     },
-    physics::model::{Model, RhsContext},
+    physics::model::{Driver, Model, NoNoise, NoiseSpec, RhsContext},
 };
+use std::marker::PhantomData;
 
 /// Karma–Rappel thin-interface asymptotics constant a₁.
 pub const A1: f64 = 0.8836;
@@ -44,15 +45,22 @@ pub const A2: f64 = 0.6267;
 /// Karma–Rappel dendritic solidification: a coupled order parameter φ and
 /// dimensionless temperature u with 4-fold anisotropic surface energy; see
 /// the module docs for the equations.
+///
+/// Generic over its driver set `N`: the default `ModelC` (= `ModelC<NoNoise>`)
+/// is deterministic and pairs with any integrator;
+/// `ModelC<Wiener<1>>` adds the additive noise term on φ and pairs with
+/// stochastic integrators only.
 #[derive(Debug, Clone)]
-pub struct ModelC {
+pub struct ModelC<N: NoiseSpec = NoNoise> {
     /// 4-fold anisotropy strength ε₄.
     pub eps4: f64,
     /// Coupling λ between undercooling and the order parameter.
     pub lambda: f64,
     /// Thermal diffusivity D = a₂λ (thin-interface relation).
     pub d_thermal: f64,
-    /// Amplitude of additive noise on φ; 0 disables the stochastic term.
+    /// Amplitude of the additive noise on φ. Takes effect only when the
+    /// driver set is `Wiener<1>`; a `NoNoise` model has no stochastic term
+    /// to scale.
     pub noise_amplitude: f64,
     /// |∇φ|⁴ threshold below which the interface is treated as flat.
     pub anisotropy_tol: f64,
@@ -63,6 +71,7 @@ pub struct ModelC {
     phi: Option<FieldHandle<f64>>,
     u: Option<FieldHandle<f64>>,
     theta: Option<FieldHandle<f64>>,
+    _noise: PhantomData<fn() -> N>,
 }
 
 /// One nucleation site: a solid seed with its own crystallographic
@@ -77,7 +86,7 @@ pub struct Grain {
     pub orientation: f64,
 }
 
-impl ModelC {
+impl<N: NoiseSpec> ModelC<N> {
     /// A visually striking parameter set: ε₄ = 0.06, λ = 3.19, no noise.
     #[must_use]
     pub fn classic() -> Self {
@@ -101,6 +110,7 @@ impl ModelC {
             phi: None,
             u: None,
             theta: None,
+            _noise: PhantomData,
         }
     }
 
@@ -307,12 +317,13 @@ impl ModelC {
 // (multi-grain) path calls `apply_oriented`, a two-input stencil the
 // single-input `Stencil` trait cannot yet express — a known trait-surface
 // limitation. Axis-aligned Model C uses only the generic trait surface.
-impl<D> Model<CartesianGrid<2>, D> for ModelC
+impl<D, N: NoiseSpec> Model<CartesianGrid<2>, D> for ModelC<N>
 where
     D: Discretizes<CartesianGrid<2>, AnisotropicDivergence, Stencil = KarmaRappelFlux>
         + Discretizes<CartesianGrid<2>, Laplacian>,
 {
     type Scalar = f64;
+    type Noise = N;
 
     fn register_fields(&mut self, builder: &mut StateBuilder<f64>) {
         self.phi = Some(builder.register("phi", 1));
@@ -336,13 +347,20 @@ where
         fill_ghosts_mirror(grid, state, self.u());
     }
 
-    fn rhs_block<S: StorageBackend<f64>>(
+    fn vector_field_block<S: StorageBackend<f64>>(
         &self,
+        driver: Driver,
         ctx: &RhsContext<'_, CartesianGrid<2>, D>,
         state: &State<f64, S>,
         out: &mut BlockStateMut<'_, f64, S>,
         _scratch: &mut Scratch<f64, S>,
     ) {
+        if let Driver::Wiener(_) = driver {
+            // Additive noise on φ only, constant amplitude.
+            let mut amp = out.view_mut(ctx.grid, ctx.block, self.phi());
+            for_each_interior(amp.interior(), |idx| amp.set(idx, self.noise_amplitude));
+            return;
+        }
         let (grid, block) = (ctx.grid, ctx.block);
         let (phi_h, u_h) = (self.phi(), self.u());
         let phi = state.view(grid, block, phi_h);
@@ -398,22 +416,6 @@ where
                 du.get(idx).mul_add(self.d_thermal, 0.5 * dphi.get(idx)),
             );
         });
-    }
-
-    fn has_noise(&self) -> bool {
-        self.noise_amplitude != 0.0
-    }
-
-    fn noise_block<S: StorageBackend<f64>>(
-        &self,
-        ctx: &RhsContext<'_, CartesianGrid<2>, D>,
-        _state: &State<f64, S>,
-        out: &mut BlockStateMut<'_, f64, S>,
-        _scratch: &mut Scratch<f64, S>,
-    ) {
-        // Additive noise on φ only, constant amplitude.
-        let mut amp = out.view_mut(ctx.grid, ctx.block, self.phi());
-        for_each_interior(amp.interior(), |idx| amp.set(idx, self.noise_amplitude));
     }
 
     /// dt = 0.2·h²/D — deliberately *below* the model's 0.25·h²/D. That

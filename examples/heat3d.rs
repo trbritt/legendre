@@ -34,7 +34,7 @@ use legendre::{
         parquet::ParquetObserver,
         progress::{FieldStat, FieldStatsSink, ProgressObserver, progress_bar},
     },
-    physics::model::{Model, RhsContext},
+    physics::model::{Driver, Model, NoNoise, RhsContext},
 };
 use std::error::Error;
 
@@ -45,6 +45,7 @@ struct Heat3 {
 
 impl<P: Discretizes<CartesianGrid<3>, Laplacian>> Model<CartesianGrid<3>, P> for Heat3 {
     type Scalar = f64;
+    type Noise = NoNoise;
 
     fn register_fields(&mut self, builder: &mut StateBuilder<f64>) {
         self.u = Some(builder.register("u", 1));
@@ -59,8 +60,9 @@ impl<P: Discretizes<CartesianGrid<3>, Laplacian>> Model<CartesianGrid<3>, P> for
         fill_ghosts_mirror(grid, state, self.u.unwrap());
     }
 
-    fn rhs_block<S: StorageBackend<f64>>(
+    fn vector_field_block<S: StorageBackend<f64>>(
         &self,
+        _driver: Driver,
         ctx: &RhsContext<'_, CartesianGrid<3>, P>,
         state: &State<f64, S>,
         out: &mut BlockStateMut<'_, f64, S>,
