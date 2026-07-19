@@ -5,6 +5,21 @@
 //!
 //! Everything runs on `SerialScheduler`: `CodSpeed` measures instruction
 //! counts, and single-threaded execution keeps them deterministic.
+//!
+//! # Flamegraph profiling
+//!
+//! With the `dev-profiling` feature, criterion's profiling hook samples
+//! the benchmark with `pprof` and writes a flamegraph, giving optimization
+//! work evidence instead of guesses:
+//!
+//! ```text
+//! cargo bench --features dev-profiling --bench core -- \
+//!     --profile-time 10 "model_c/step/em_deterministic"
+//! # -> target/criterion/model_c/step/em_deterministic/profile/flamegraph.svg
+//! ```
+//!
+//! Profiling only engages under `--profile-time`; plain `cargo bench` and
+//! the `CodSpeed` CI run are unaffected.
 
 // `criterion_group!` holds its `Criterion` to the end of `main` (the
 // "tighten this drop" suggestion cannot apply inside the macro expansion)
@@ -111,5 +126,65 @@ fn primitives(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, integrator_steps, primitives);
+/// Criterion `Profiler` that samples the benchmark under `--profile-time`
+/// and writes `profile/flamegraph.svg` next to the benchmark's report.
+#[cfg(feature = "dev-profiling")]
+mod profiling {
+    use criterion::profiler::Profiler;
+    use pprof::ProfilerGuard;
+    use std::{fs::File, path::Path};
+
+    pub struct Flamegraph<'a> {
+        frequency: i32,
+        active: Option<ProfilerGuard<'a>>,
+    }
+
+    impl Flamegraph<'_> {
+        pub const fn new(frequency: i32) -> Self {
+            Self {
+                frequency,
+                active: None,
+            }
+        }
+    }
+
+    impl Profiler for Flamegraph<'_> {
+        fn start_profiling(&mut self, _benchmark_id: &str, _benchmark_dir: &Path) {
+            self.active = Some(ProfilerGuard::new(self.frequency).expect("start pprof sampler"));
+        }
+
+        fn stop_profiling(&mut self, _benchmark_id: &str, benchmark_dir: &Path) {
+            let Some(profiler) = self.active.take() else {
+                return;
+            };
+            std::fs::create_dir_all(benchmark_dir).expect("create profile dir");
+            let file =
+                File::create(benchmark_dir.join("flamegraph.svg")).expect("create flamegraph.svg");
+            profiler
+                .report()
+                .build()
+                .expect("build pprof report")
+                .flamegraph(file)
+                .expect("write flamegraph");
+        }
+    }
+}
+
+fn config() -> Criterion {
+    // 997 Hz: a prime sampling rate avoids lock-step with periodic work.
+    #[cfg(feature = "dev-profiling")]
+    {
+        Criterion::default().with_profiler(profiling::Flamegraph::new(997))
+    }
+    #[cfg(not(feature = "dev-profiling"))]
+    {
+        Criterion::default()
+    }
+}
+
+criterion_group! {
+    name = benches;
+    config = config();
+    targets = integrator_steps, primitives
+}
 criterion_main!(benches);
