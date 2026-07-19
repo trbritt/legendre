@@ -31,6 +31,7 @@ pub struct CartesianGrid<const D: usize> {
     blocks_per_dim: [usize; D],
     origin: [f64; D],
     spacing: [f64; D],
+    periodic: [bool; D],
 }
 
 impl<const D: usize> CartesianGrid<D> {
@@ -76,7 +77,29 @@ impl<const D: usize> CartesianGrid<D> {
             blocks_per_dim,
             origin,
             spacing,
+            periodic: [false; D],
         })
+    }
+
+    /// Mark dimensions as periodic: the domain wraps, so the last block's
+    /// high face neighbors the first block's low face (possibly the same
+    /// block when one block spans the dimension).
+    ///
+    /// Periodicity is **topology, not physics**: [`Self::face_neighbor`]
+    /// wraps in periodic dimensions, so every ghost-fill helper built on it
+    /// (e.g. [`fill_ghosts_mirror`]) exchanges halos across the wrap
+    /// automatically and applies its physical boundary rule only on the
+    /// remaining non-periodic faces. Models never mention periodicity.
+    #[must_use]
+    pub const fn with_periodic(mut self, periodic: [bool; D]) -> Self {
+        self.periodic = periodic;
+        self
+    }
+
+    /// Which dimensions are periodic.
+    #[must_use]
+    pub const fn periodic(&self) -> [bool; D] {
+        self.periodic
     }
 
     /// Whole domain as one block — convenient for small runs and tests.
@@ -124,20 +147,27 @@ impl<const D: usize> CartesianGrid<D> {
         out
     }
 
-    /// Neighbor block across face `(dim, +1/-1)`, or `None` at the domain
-    /// boundary. This is the topology query halo exchange is built on.
+    /// Neighbor block across face `(dim, +1/-1)`: `None` at a non-periodic
+    /// domain boundary, the wrapped block in a periodic dimension (which is
+    /// `block` itself when one block spans it). This is the topology query
+    /// halo exchange is built on.
     #[allow(clippy::needless_range_loop)]
     #[must_use]
     pub fn face_neighbor(&self, block: BlockId, dim: usize, dir: isize) -> Option<BlockId> {
         let coords = self.block_coords(block);
-        let next = coords[dim] as isize + dir.signum();
-        if next < 0 || next as usize >= self.blocks_per_dim[dim] {
+        let stepped = coords[dim] as isize + dir.signum();
+        let nb = self.blocks_per_dim[dim] as isize;
+        let next = if (0..nb).contains(&stepped) {
+            stepped as usize
+        } else if self.periodic[dim] {
+            stepped.rem_euclid(nb) as usize
+        } else {
             return None;
-        }
+        };
         let mut id = 0usize;
         let mut stride = 1usize;
         for d in 0..D {
-            let c = if d == dim { next as usize } else { coords[d] };
+            let c = if d == dim { next } else { coords[d] };
             id += c * stride;
             stride *= self.blocks_per_dim[d];
         }
@@ -280,15 +310,18 @@ pub fn for_each_box<const D: usize>(lo: [isize; D], hi: [isize; D], mut f: impl 
     }
 }
 
-/// Fill one field's ghost cells: halo exchange across interior block faces,
-/// mirror (no-flux) at physical boundaries.
+/// Fill one field's ghost cells: halo exchange across interior block faces
+/// — wrapping across the domain in periodic dimensions — and mirror
+/// (no-flux) at the remaining non-periodic physical boundaries.
 ///
 /// Works dimension by dimension; each sweep `d` writes only `d`-ghost strips
 /// and reads only `d`-interior strips, spanning the *full* ghost-inclusive
 /// extent in the other dimensions. After all `D` sweeps, edge and corner
 /// ghosts are consistent — explicit face-then-corner copies, generalized
-/// to any block count and dimension. Sequential over blocks for now; the sweeps
-/// are embarrassingly parallel per block if this ever shows up in profiles.
+/// to any block count and dimension (including a periodic dimension spanned
+/// by a single block, which wraps onto itself). Sequential over blocks for
+/// now; the sweeps are embarrassingly parallel per block if this ever shows
+/// up in profiles.
 pub fn fill_ghosts_mirror<T: Scalar, S: StorageBackend<T>, const D: usize>(
     grid: &CartesianGrid<D>,
     state: &mut State<T, S>,
@@ -316,17 +349,31 @@ pub fn fill_ghosts_mirror<T: Scalar, S: StorageBackend<T>, const D: usize>(
                 // Ghost strip on this side: idx[d] ∈ [-g, 0) or [n, n+g).
                 (lo[d], hi[d]) = if dir < 0 { (-g, 0) } else { (n, n + g) };
                 if let Some(nb) = grid.face_neighbor(block, d, dir) {
-                    // My ghost layer k mirrors the neighbor's interior:
+                    // My ghost layer k copies the neighbor's interior:
                     // low side: idx[d] = -1-k  ←  neighbor n-1-k
                     // high side: idx[d] = n+k  ←  neighbor k
-                    let (dst, src) = state.slab_pair_mut(block, nb, handle);
-                    let mut vd = grid.view_mut(block, ghost, dst);
-                    let vs = grid.view(nb, ghost, src);
-                    for_each_box(lo, hi, |idx| {
-                        let mut sidx = idx;
-                        sidx[d] = if dir < 0 { n + idx[d] } else { idx[d] - n };
-                        vd.set(idx, vs.get(sidx));
-                    });
+                    if nb == block {
+                        // Periodic wrap onto itself (one block spans this
+                        // dimension): same index map, within one slab.
+                        // Sources are d-interior entries, writes are
+                        // d-ghost entries, so nothing read is overwritten.
+                        let slab = state.slab_mut(block, handle);
+                        let mut v = grid.view_mut(block, ghost, slab);
+                        for_each_box(lo, hi, |idx| {
+                            let mut sidx = idx;
+                            sidx[d] = if dir < 0 { n + idx[d] } else { idx[d] - n };
+                            v.set(idx, v.get(sidx));
+                        });
+                    } else {
+                        let (dst, src) = state.slab_pair_mut(block, nb, handle);
+                        let mut vd = grid.view_mut(block, ghost, dst);
+                        let vs = grid.view(nb, ghost, src);
+                        for_each_box(lo, hi, |idx| {
+                            let mut sidx = idx;
+                            sidx[d] = if dir < 0 { n + idx[d] } else { idx[d] - n };
+                            vd.set(idx, vs.get(sidx));
+                        });
+                    }
                 } else {
                     // Physical boundary: mirror across the face,
                     // ghost -1-k ← interior k (and n+k ← n-1-k).
@@ -344,6 +391,39 @@ pub fn fill_ghosts_mirror<T: Scalar, S: StorageBackend<T>, const D: usize>(
                 }
             }
         }
+    }
+}
+
+/// Set one field's interior from a function of the cell-center coordinate
+/// — the declarative form of an initial condition:
+///
+/// ```
+/// # use legendre::core::state::StateBuilder;
+/// # use legendre::core::storage::{DenseStorage, SystemAllocator};
+/// # use legendre::geometry::cartesian::{CartesianGrid, fill_from_fn};
+/// # let grid = CartesianGrid::new([8; 2], [4; 2], [0.0; 2], [0.5; 2]).unwrap();
+/// # let mut builder = StateBuilder::<f64>::new();
+/// # let u = builder.register("u", 1);
+/// # let mut state: legendre::core::state::State<f64, DenseStorage<f64>> =
+/// #     builder.build(&grid, &SystemAllocator);
+/// fill_from_fn(&grid, &mut state, u, |[x, y]| (x * y).cos());
+/// ```
+///
+/// Writes interior cells only; ghosts become consistent through the
+/// model's `fill_ghosts` before the first evaluation, as always. `f` is
+/// `FnMut` so closures may carry state (e.g. a seeded generator).
+pub fn fill_from_fn<T: Scalar, S: StorageBackend<T>, const D: usize>(
+    grid: &CartesianGrid<D>,
+    state: &mut State<T, S>,
+    handle: FieldHandle<T>,
+    mut f: impl FnMut([f64; D]) -> T,
+) {
+    for b in 0..grid.num_blocks() {
+        let block = BlockId(b as u32);
+        let mut v = state.view_mut(grid, block, handle);
+        for_each_interior(grid.block_cells(), |idx| {
+            v.set(idx, f(grid.cell_center(block, idx)));
+        });
     }
 }
 
