@@ -287,9 +287,9 @@ mod intergrid {
         });
     }
 
-    struct Heat {
-        kappa: f64,
-        u: Option<FieldHandle<f64>>,
+    pub struct Heat {
+        pub kappa: f64,
+        pub u: Option<FieldHandle<f64>>,
     }
 
     impl<D> Model<AmrGrid<2>, D> for Heat
@@ -432,9 +432,9 @@ mod intergrid {
         }
     }
 
-    struct UniformHeat {
-        kappa: f64,
-        u: Option<FieldHandle<f64>>,
+    pub struct UniformHeat {
+        pub kappa: f64,
+        pub u: Option<FieldHandle<f64>>,
     }
 
     impl<D> Model<CartesianGrid<2>, D> for UniformHeat
@@ -540,5 +540,358 @@ mod intergrid {
             "heat must decay from the initial peak of 1: max {hi}"
         );
         assert!(hi > 0.0 && lo > -1e-9, "maximum principle: [{lo}, {hi}]");
+    }
+}
+
+/// Phase D: the Berger–Oliger adaptivity policy on the plain `Simulation`.
+mod adaptive {
+    use super::intergrid::Heat;
+    use super::*;
+    use legendre::geometry::{
+        amr::{BergerOliger, ClusterParams, GradientTagger, RegridPolicy, TagCells, restrict},
+        cartesian::for_each_interior,
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn gaussian([x, y]: [f64; 2]) -> f64 {
+        let (dx, dy) = (x - 4.0, y - 4.0);
+        (-dx.mul_add(dx, dy * dy) / 0.4).exp()
+    }
+
+    fn fill_amr(
+        grid: &AmrGrid<2>,
+        state: &mut State<f64, DenseStorage<f64>>,
+        u: FieldHandle<f64>,
+        f: impl Fn([f64; 2]) -> f64,
+    ) {
+        for b in 0..grid.num_blocks() {
+            let block = BlockId(b as u32);
+            let ext = grid.patch(block).extent();
+            let mut v = state.view_mut(grid, block, u);
+            for_each_interior(ext, |idx| v.set(idx, f(grid.cell_center(block, idx))));
+        }
+    }
+
+    const fn policy() -> BergerOliger<GradientTagger> {
+        BergerOliger::new(
+            GradientTagger {
+                field: "u",
+                threshold: 0.05,
+            },
+            RegridPolicy {
+                every: 4,
+                buffer: 2,
+                cluster: ClusterParams {
+                    efficiency: 0.7,
+                    min_width: 2,
+                },
+            },
+        )
+    }
+
+    /// The very first step regrids from the initial conditions: every
+    /// high-gradient base cell ends up interior to a level-1 patch, and
+    /// the run stays refined and physical through later regrids.
+    #[test]
+    fn initial_regrid_refines_around_the_feature() {
+        let base = CartesianGrid::new([16, 16], [8, 8], [0.0, 0.0], [0.5, 0.5]).unwrap();
+        let grid = AmrGrid::from_patches(base, &[2], &[]).unwrap();
+        let mut sim = Simulation::adaptive(
+            grid,
+            FiniteDifference,
+            Heat {
+                kappa: 0.7,
+                u: None,
+            },
+            ForwardEuler,
+            SerialScheduler,
+            SystemAllocator,
+            policy(),
+        );
+        let u = sim.model().u.unwrap();
+        {
+            let (grid, state) = sim.state_mut();
+            fill_amr(grid, state, u, gaussian);
+        }
+        let dt = 0.2 * 0.25 * 0.25 / 0.7;
+        sim.step(dt); // step 0: initial refinement from the ICs
+
+        assert_eq!(
+            sim.grid().num_levels(),
+            2,
+            "the bump must trigger refinement"
+        );
+        // Every base cell whose IC gradient beats the threshold sits under
+        // a fine patch.
+        let g = sim.grid();
+        for cell_y in 0..16i64 {
+            for cell_x in 0..16i64 {
+                let center = [
+                    0.5f64.mul_add(cell_x as f64, 0.25),
+                    0.5f64.mul_add(cell_y as f64, 0.25),
+                ];
+                let gx = (gaussian([center[0] + 0.5, center[1]])
+                    - gaussian([center[0] - 0.5, center[1]]))
+                    / 2.0;
+                let gy = (gaussian([center[0], center[1] + 0.5])
+                    - gaussian([center[0], center[1] - 0.5]))
+                    / 2.0;
+                if gx.abs().max(gy.abs()) > 0.06 {
+                    let fine = [cell_x * 2, cell_y * 2];
+                    assert!(
+                        g.find_patch(1, fine).is_some(),
+                        "high-gradient cell ({cell_x},{cell_y}) not refined"
+                    );
+                }
+            }
+        }
+
+        // A few more steps: the bump is still sharp, refinement persists.
+        // (Run long enough and the policy correctly *de-refines* the
+        // flattened Gaussian — that behavior is pinned in the comparison
+        // test below.)
+        for _ in 0..8 {
+            sim.step(dt);
+        }
+        assert_eq!(
+            sim.grid().num_levels(),
+            2,
+            "feature still present, still refined"
+        );
+        for b in 0..sim.grid().num_blocks() {
+            let block = BlockId(b as u32);
+            let ext = sim.grid().patch(block).extent();
+            let v = sim.state().view(sim.grid(), block, u);
+            for_each_interior(ext, |idx| {
+                let x = v.get(idx);
+                assert!(
+                    x.is_finite() && (-1e-9..=1.0).contains(&x),
+                    "unphysical {x}"
+                );
+            });
+        }
+    }
+
+    /// The whole point of AMR, as one assertion: against a restricted
+    /// uniform-fine reference, the adaptive run beats the uniform-coarse
+    /// run — at a fraction of the fine run's cell count.
+    #[test]
+    fn adaptive_beats_coarse_against_fine_reference() {
+        let kappa = 0.7;
+        let dt = 0.2 * 0.25 * 0.25 / kappa;
+        let steps = 60;
+
+        // Uniform fine 32² reference, restricted to 16².
+        let fine = CartesianGrid::new([32, 32], [16, 16], [0.0, 0.0], [0.25, 0.25]).unwrap();
+        let mut fsim = Simulation::new(
+            fine,
+            FiniteDifference,
+            super::intergrid::UniformHeat { kappa, u: None },
+            ForwardEuler,
+            SerialScheduler,
+            SystemAllocator,
+        );
+        let fu = fsim.model().u.unwrap();
+        {
+            let (grid, state) = fsim.state_mut();
+            legendre::geometry::cartesian::fill_from_fn(grid, state, fu, gaussian);
+        }
+        for _ in 0..steps {
+            fsim.step(dt);
+        }
+        let mut reference = vec![[0.0f64; 16]; 16];
+        for b in 0..fsim.grid().num_blocks() {
+            let block = BlockId(b as u32);
+            let v = fsim.state().view(fsim.grid(), block, fu);
+            for_each_interior(fsim.grid().block_cells(), |idx| {
+                let [x, y] = fsim.grid().cell_center(block, idx);
+                let (cx, cy) = ((x / 0.5) as usize, (y / 0.5) as usize);
+                reference[cy][cx] += v.get(idx) * 0.25;
+            });
+        }
+
+        // Uniform coarse 16².
+        let coarse = CartesianGrid::new([16, 16], [8, 8], [0.0, 0.0], [0.5, 0.5]).unwrap();
+        let mut csim = Simulation::new(
+            coarse,
+            FiniteDifference,
+            super::intergrid::UniformHeat { kappa, u: None },
+            ForwardEuler,
+            SerialScheduler,
+            SystemAllocator,
+        );
+        let cu = csim.model().u.unwrap();
+        {
+            let (grid, state) = csim.state_mut();
+            legendre::geometry::cartesian::fill_from_fn(grid, state, cu, gaussian);
+        }
+        for _ in 0..steps {
+            csim.step(dt);
+        }
+
+        // Adaptive: coarse base, one refinement level, |∇u| tagging.
+        let base = CartesianGrid::new([16, 16], [8, 8], [0.0, 0.0], [0.5, 0.5]).unwrap();
+        let grid = AmrGrid::from_patches(base, &[2], &[]).unwrap();
+        let mut asim = Simulation::adaptive(
+            grid,
+            FiniteDifference,
+            Heat { kappa, u: None },
+            ForwardEuler,
+            SerialScheduler,
+            SystemAllocator,
+            policy(),
+        );
+        let au = asim.model().u.unwrap();
+        {
+            let (grid, state) = asim.state_mut();
+            fill_amr(grid, state, au, gaussian);
+        }
+        let mut refined_cells = 0usize;
+        for _ in 0..steps {
+            asim.step(dt);
+            refined_cells = refined_cells.max(
+                asim.grid()
+                    .blocks_at(1)
+                    .map(|b| asim.grid().patch(b).bx.cells() as usize)
+                    .sum(),
+            );
+        }
+        // Compose the adaptive solution onto the coarse cells.
+        {
+            let (grid, state) = asim.state_mut();
+            restrict(grid, state, au);
+        }
+        let (mut err_adaptive, mut err_coarse) = (0.0f64, 0.0f64);
+        for b in asim.grid().blocks_at(0) {
+            let p = *asim.grid().patch(b);
+            let va = asim.state().view(asim.grid(), b, au);
+            let vc = csim.state().view(csim.grid(), b, cu);
+            for_each_interior(p.extent(), |idx| {
+                let gx = (p.bx.lo[0] + idx[0] as i64) as usize;
+                let gy = (p.bx.lo[1] + idx[1] as i64) as usize;
+                err_adaptive = err_adaptive.max((va.get(idx) - reference[gy][gx]).abs());
+                err_coarse = err_coarse.max((vc.get(idx) - reference[gy][gx]).abs());
+            });
+        }
+        approx::assert_relative_eq!(err_adaptive, 0.001_680_900f64, epsilon = 1e-6);
+        approx::assert_relative_eq!(err_coarse, 0.003_716_000f64, epsilon = 1e-6);
+
+        // We heavily refine from the default otherwise of 32x32=1024
+        assert_eq!(
+            refined_cells, 400,
+            "refinement must stay partial: {refined_cells} fine cells"
+        );
+    }
+
+    /// Migration is exact on linear fields, through both paths: copy from
+    /// the old same-level patch, and prolongation of newly refined
+    /// regions — pinned by moving a forced refinement box mid-run under a
+    /// do-nothing model.
+    struct BoxTagger {
+        calls: AtomicU64,
+    }
+
+    impl TagCells<f64, 2> for BoxTagger {
+        fn tag_level<S: StorageBackend<f64>>(
+            &self,
+            _grid: &AmrGrid<2>,
+            _state: &State<f64, S>,
+            level: u8,
+            flags: &mut Vec<[i64; 2]>,
+        ) {
+            if level != 0 {
+                return;
+            }
+            // First regrid: box [2,6)²; later: shifted box [4,8)².
+            let shift = i64::from(self.calls.fetch_add(1, Ordering::Relaxed) > 0) * 2;
+            for y in 2 + shift..6 + shift {
+                for x in 2 + shift..6 + shift {
+                    flags.push([x, y]);
+                }
+            }
+        }
+    }
+
+    struct Frozen {
+        u: Option<FieldHandle<f64>>,
+    }
+
+    impl<D: Sync> Model<AmrGrid<2>, D> for Frozen {
+        type Scalar = f64;
+        type Drivers = NoNoise;
+
+        fn register_fields(&mut self, builder: &mut StateBuilder<f64>) {
+            self.u = Some(builder.register("u", 1));
+        }
+
+        fn vector_field_block<S: StorageBackend<f64>>(
+            &self,
+            _driver: Driver,
+            ctx: &RhsContext<'_, AmrGrid<2>, D>,
+            _state: &State<f64, S>,
+            out: &mut BlockStateMut<'_, f64, S>,
+            _scratch: &mut Scratch<f64, S>,
+        ) {
+            let u = self.u.unwrap();
+            let ext = ctx.grid.patch(ctx.block).extent();
+            let mut dv = out.view_mut(ctx.grid, ctx.block, u);
+            for_each_interior(ext, |idx| dv.set(idx, 0.0));
+        }
+    }
+
+    #[test]
+    fn migration_preserves_linear_fields_exactly() {
+        let lin = |[x, y]: [f64; 2]| 3.0f64.mul_add(x, 2.0) - y;
+        let base = CartesianGrid::new([16, 16], [8, 8], [0.0, 0.0], [0.5, 0.5]).unwrap();
+        let grid = AmrGrid::from_patches(base, &[2], &[]).unwrap();
+        let mut sim = Simulation::adaptive(
+            grid,
+            FiniteDifference,
+            Frozen { u: None },
+            ForwardEuler,
+            SerialScheduler,
+            SystemAllocator,
+            BergerOliger::new(
+                BoxTagger {
+                    calls: AtomicU64::new(0),
+                },
+                RegridPolicy {
+                    every: 1,
+                    buffer: 0,
+                    cluster: ClusterParams {
+                        efficiency: 0.9,
+                        min_width: 2,
+                    },
+                },
+            ),
+        );
+        let u = sim.model().u.unwrap();
+        {
+            let (grid, state) = sim.state_mut();
+            fill_amr(grid, state, u, lin);
+        }
+        let dt = 1e-3;
+        sim.step(dt); // regrid to [2,6)² (prolongation path), step frozen
+        sim.step(dt); // regrid to [4,8)² (copy overlap + prolong the rest)
+
+        assert_eq!(sim.grid().num_levels(), 2);
+        let fine: Vec<BlockId> = sim.grid().blocks_at(1).collect();
+        assert!(!fine.is_empty());
+        for fb in fine {
+            let p = *sim.grid().patch(fb);
+            assert_eq!(
+                p.bx,
+                CellBox {
+                    lo: [8, 8],
+                    hi: [16, 16]
+                },
+                "shifted box expected"
+            );
+            let v = sim.state().view(sim.grid(), fb, u);
+            for_each_interior(p.extent(), |idx| {
+                let c = sim.grid().cell_center(fb, idx);
+                approx::assert_relative_eq!(v.get(idx), lin(c), epsilon = 1e-12);
+            });
+        }
     }
 }

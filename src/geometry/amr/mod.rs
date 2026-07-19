@@ -14,10 +14,12 @@
 //!
 //! [`Grid`]: crate::geometry::grid::Grid
 
+mod adapt;
 mod cluster;
 mod grid;
 mod intergrid;
 
+pub use adapt::{BergerOliger, GradientTagger, RegridPolicy, TagCells};
 pub use cluster::{CellBox, ClusterParams, cluster};
 pub use grid::{AmrGrid, AmrPatch};
 pub use intergrid::{fill_ghosts_mirror, restrict};

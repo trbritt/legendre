@@ -93,7 +93,7 @@ impl<const D: usize> AmrGrid<D> {
                 ratios: ratios.len(),
             });
         }
-        for &r in &ratios[..levels.len()] {
+        for &r in ratios {
             if r < 2 {
                 return Err(GridError::AmrRatio {
                     levels: levels.len(),
@@ -101,7 +101,9 @@ impl<const D: usize> AmrGrid<D> {
                 });
             }
         }
-        let ratios = ratios[..levels.len()].to_vec();
+        // The full ratio list is *capacity*: an adaptivity policy may
+        // populate levels the initial hierarchy leaves empty.
+        let ratios = ratios.to_vec();
 
         // Level 0: the base grid's blocks as patches.
         let mut patches: Vec<AmrPatch<D>> = (0..base.num_blocks())
@@ -186,9 +188,15 @@ impl<const D: usize> AmrGrid<D> {
         &self.ratios
     }
 
-    /// Number of levels (≥ 1; level 0 is the base).
+    /// Number of *populated* levels (≥ 1; level 0 is the base).
     #[must_use]
     pub const fn num_levels(&self) -> usize {
+        self.level_start.len() - 1
+    }
+
+    /// Maximum levels this hierarchy's ratio list allows.
+    #[must_use]
+    pub const fn max_levels(&self) -> usize {
         self.ratios.len() + 1
     }
 
@@ -210,10 +218,17 @@ impl<const D: usize> AmrGrid<D> {
         level_domain(&self.base, &self.ratios, level)
     }
 
-    /// The blocks of one level, in id order.
+    /// The blocks of one level, in id order (empty for levels the
+    /// hierarchy does not currently populate — e.g. after a regrid
+    /// removed its last patch).
     pub fn blocks_at(&self, level: u8) -> impl Iterator<Item = BlockId> + use<D> {
         let l = level as usize;
-        (self.level_start[l]..self.level_start[l + 1]).map(BlockId)
+        let (start, end) = if l + 1 < self.level_start.len() {
+            (self.level_start[l], self.level_start[l + 1])
+        } else {
+            (0, 0)
+        };
+        (start..end).map(BlockId)
     }
 
     /// The level-`level` patch containing `cell`, if any.

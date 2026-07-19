@@ -317,6 +317,46 @@ impl<T: Scalar, S: StorageBackend<T>> State<T, S> {
         self.like_impl(grid, alloc, |spec| spec.is_driven_by(driver))
     }
 
+    /// A buffer with this state's layout allocated over a *different*
+    /// grid's block structure — the regrid migration target. Carries
+    /// every field (statics included); the shared layout keeps existing
+    /// [`FieldHandle`]s valid on the new state.
+    #[must_use]
+    pub fn reshaped<G: Grid, A: Allocator<T, Storage = S>>(&self, grid: &G, alloc: &A) -> Self {
+        let blocks = (0..grid.num_blocks())
+            .map(|b| BlockStorage::allocate(&self.layout, grid, BlockId(b as u32), alloc, |_| true))
+            .collect();
+        Self {
+            layout: Arc::clone(&self.layout),
+            blocks,
+        }
+    }
+
+    /// Mint the handle of the field at `index` (regrid migration sweeps
+    /// every field without knowing the model's handles). Kept crate-only:
+    /// the builder remains the sole public mint.
+    pub(crate) const fn handle_at(index: usize) -> FieldHandle<T> {
+        FieldHandle {
+            index,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Handle of the field registered under `name`, if any — how
+    /// components constructed *before* field registration (adaptivity
+    /// taggers, observers) resolve the fields they act on.
+    #[must_use]
+    pub fn field(&self, name: &str) -> Option<FieldHandle<T>> {
+        self.layout
+            .specs()
+            .iter()
+            .position(|s| s.name == name)
+            .map(|index| FieldHandle {
+                index,
+                _marker: PhantomData,
+            })
+    }
+
     fn like_impl<G: Grid, A: Allocator<T, Storage = S>>(
         &self,
         grid: &G,
