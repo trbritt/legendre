@@ -60,6 +60,8 @@ pub struct AmrGrid<const D: usize> {
     patches: Vec<AmrPatch<D>>,
     /// Precomputed per-level cell spacing.
     level_spacing: Vec<[f64; D]>,
+    /// `level_start[l]..level_start[l+1]` are level `l`'s patch indices.
+    level_start: Vec<u32>,
 }
 
 impl<const D: usize> AmrGrid<D> {
@@ -117,6 +119,7 @@ impl<const D: usize> AmrGrid<D> {
             .collect();
 
         // Finer levels, validated against the level below.
+        let mut level_start = vec![0u32, patches.len() as u32];
         let mut coarser: Vec<CellBox<D>> = patches.iter().map(|p| p.bx).collect();
         for (l, boxes) in levels.iter().enumerate() {
             let level = (l + 1) as u8;
@@ -128,6 +131,9 @@ impl<const D: usize> AmrGrid<D> {
                 }
                 if bx.clipped(&domain) != *bx {
                     return Err(GridError::AmrNotNested { level });
+                }
+                if (0..D).any(|d| bx.lo[d] % r != 0 || bx.hi[d] % r != 0) {
+                    return Err(GridError::AmrMisaligned { level });
                 }
                 for other in &boxes[..i] {
                     if bx.intersects(other) {
@@ -149,6 +155,7 @@ impl<const D: usize> AmrGrid<D> {
                 }
             }
             patches.extend(boxes.iter().map(|&bx| AmrPatch { level, bx }));
+            level_start.push(patches.len() as u32);
             coarser.clone_from(boxes);
         }
 
@@ -163,6 +170,7 @@ impl<const D: usize> AmrGrid<D> {
             ratios,
             patches,
             level_spacing,
+            level_start,
         })
     }
 
@@ -200,6 +208,19 @@ impl<const D: usize> AmrGrid<D> {
     #[must_use]
     pub fn level_domain(&self, level: u8) -> CellBox<D> {
         level_domain(&self.base, &self.ratios, level)
+    }
+
+    /// The blocks of one level, in id order.
+    pub fn blocks_at(&self, level: u8) -> impl Iterator<Item = BlockId> + use<D> {
+        let l = level as usize;
+        (self.level_start[l]..self.level_start[l + 1]).map(BlockId)
+    }
+
+    /// The level-`level` patch containing `cell`, if any.
+    #[must_use]
+    pub fn find_patch(&self, level: u8, cell: [i64; D]) -> Option<BlockId> {
+        self.blocks_at(level)
+            .find(|&b| self.patch(b).bx.contains(cell))
     }
 }
 

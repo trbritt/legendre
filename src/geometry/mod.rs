@@ -51,6 +51,14 @@ pub enum GridError {
         /// The offending level.
         level: u8,
     },
+    /// An AMR patch's box is not aligned to its refinement ratio
+    /// (both `lo` and `hi` must be multiples of the level's ratio, so
+    /// every coarse cell is either fully refined or not at all).
+    #[error("AMR patch at level {level} is not aligned to its refinement ratio")]
+    AmrMisaligned {
+        /// The offending level.
+        level: u8,
+    },
     /// An AMR patch violates proper nesting (Berger–Oliger: coarsened and
     /// grown by one cell, it must lie in the union of the level below,
     /// except at the physical domain boundary).

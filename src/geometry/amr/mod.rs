@@ -16,6 +16,8 @@
 
 mod cluster;
 mod grid;
+mod intergrid;
 
 pub use cluster::{CellBox, ClusterParams, cluster};
 pub use grid::{AmrGrid, AmrPatch};
+pub use intergrid::{fill_ghosts_mirror, restrict};
