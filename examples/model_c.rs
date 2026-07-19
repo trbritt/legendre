@@ -35,7 +35,7 @@ use legendre::{
         progress::{FieldStat, FieldStatsSink, ProgressObserver, progress_bar},
     },
     physics::{
-        model::{NoNoise, NoiseSpec, Wiener},
+        model::{DriverSet, NoNoise, Wiener},
         phasefield::{Grain, ModelC},
     },
     util::rng::{mix_key, unit_open},
@@ -114,6 +114,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             run::<NoNoise, _>(RungeKutta4, &args)
         }
+        // Zero amplitude means the model *has no Wiener driver*: select the
+        // NoNoise instantiation so the run pays nothing for the absent term
+        // (exactly what the pre-driver `has_noise()` runtime gate did).
+        Scheme::Em if args.noise == 0.0 => {
+            run::<NoNoise, _>(EulerMaruyama { seed: args.seed }, &args)
+        }
         Scheme::Em => run::<Wiener<1>, _>(EulerMaruyama { seed: args.seed }, &args),
     }
 }
@@ -153,7 +159,7 @@ fn seed_positions(args: &Args) -> Vec<Grain> {
 
 fn run<N, I>(integrator: I, args: &Args) -> Result<(), Box<dyn Error>>
 where
-    N: NoiseSpec,
+    N: DriverSet,
     I: Integrator<CartesianGrid<2>, FiniteVolume, N> + 'static,
 {
     let grid = CartesianGrid::new(

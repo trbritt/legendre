@@ -45,7 +45,7 @@ struct Heat3 {
 
 impl<P: Discretizes<CartesianGrid<3>, Laplacian>> Model<CartesianGrid<3>, P> for Heat3 {
     type Scalar = f64;
-    type Noise = NoNoise;
+    type Drivers = NoNoise;
 
     fn register_fields(&mut self, builder: &mut StateBuilder<f64>) {
         self.u = Some(builder.register("u", 1));

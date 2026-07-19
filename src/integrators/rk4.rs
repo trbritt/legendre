@@ -6,8 +6,8 @@ use crate::{
         storage::{Real, StorageBackend},
     },
     geometry::grid::Grid,
-    integrators::{Integrator, StageLayout, eval_drift},
-    physics::model::{Model, NoNoise},
+    integrators::{Integrator, StageKind, StageLayout, eval_drift},
+    physics::model::{Driver, Model, NoNoise},
 };
 
 /// Classic fourth-order Runge–Kutta.
@@ -22,10 +22,9 @@ pub struct RungeKutta4;
 
 impl<G: Grid, D: Sync> Integrator<G, D, NoNoise> for RungeKutta4 {
     fn stage_layout(&self) -> StageLayout {
-        StageLayout {
-            tendency: 4,    // k1..k4
-            stage_state: 1, // y_tmp
-        }
+        let mut stages = vec![StageKind::Tendency(Driver::Time); 4]; // k1..k4
+        stages.push(StageKind::State); // y_tmp
+        StageLayout { stages }
     }
 
     fn step<M, S, Sch>(
@@ -40,7 +39,7 @@ impl<G: Grid, D: Sync> Integrator<G, D, NoNoise> for RungeKutta4 {
         t: f64,
         dt: f64,
     ) where
-        M: Model<G, D, Noise = NoNoise>,
+        M: Model<G, D, Drivers = NoNoise>,
         S: StorageBackend<M::Scalar>,
         Sch: Scheduler,
     {

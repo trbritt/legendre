@@ -6,8 +6,8 @@ use crate::{
         storage::{Real, StorageBackend},
     },
     geometry::grid::Grid,
-    integrators::{Integrator, StageLayout, eval_drift},
-    physics::model::{Model, NoNoise},
+    integrators::{Integrator, StageKind, StageLayout, eval_drift},
+    physics::model::{Driver, Model, NoNoise},
 };
 
 /// Explicit forward Euler: `Y ← Y + dt·f(Y, t)`.
@@ -21,8 +21,7 @@ pub struct ForwardEuler;
 impl<G: Grid, D: Sync> Integrator<G, D, NoNoise> for ForwardEuler {
     fn stage_layout(&self) -> StageLayout {
         StageLayout {
-            tendency: 1,
-            stage_state: 0,
+            stages: vec![StageKind::Tendency(Driver::Time)],
         }
     }
 
@@ -38,7 +37,7 @@ impl<G: Grid, D: Sync> Integrator<G, D, NoNoise> for ForwardEuler {
         t: f64,
         dt: f64,
     ) where
-        M: Model<G, D, Noise = NoNoise>,
+        M: Model<G, D, Drivers = NoNoise>,
         S: StorageBackend<M::Scalar>,
         Sch: Scheduler,
     {

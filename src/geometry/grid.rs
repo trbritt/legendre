@@ -94,7 +94,7 @@ pub trait Grid: Send + Sync + 'static {
     /// cell even when their slab layouts differ. This is the key the
     /// per-cell noise broadcast is built on: one Wiener increment per
     /// (block, cell, driver, step), identical for every field the driver
-    /// moves (see [`crate::core::state::State::add_wiener`]).
+    /// moves (see [`crate::core::state::State::apply_driver`]).
     fn cell_key(&self, block: BlockId, ghost: u32, offset: usize) -> Option<u64>;
 
     /// Wrap one block's raw slab in a typed read view.

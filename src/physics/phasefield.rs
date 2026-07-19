@@ -33,7 +33,7 @@ use crate::{
         cartesian::{CartesianGrid, fill_ghosts_mirror, for_each_interior},
         grid::{BlockId, Grid},
     },
-    physics::model::{Driver, Model, NoNoise, NoiseSpec, RhsContext},
+    physics::model::{Driver, DriverSet, Model, NoNoise, RhsContext},
 };
 use std::marker::PhantomData;
 
@@ -51,7 +51,7 @@ pub const A2: f64 = 0.6267;
 /// `ModelC<Wiener<1>>` adds the additive noise term on φ and pairs with
 /// stochastic integrators only.
 #[derive(Debug, Clone)]
-pub struct ModelC<N: NoiseSpec = NoNoise> {
+pub struct ModelC<N: DriverSet = NoNoise> {
     /// 4-fold anisotropy strength ε₄.
     pub eps4: f64,
     /// Coupling λ between undercooling and the order parameter.
@@ -86,7 +86,7 @@ pub struct Grain {
     pub orientation: f64,
 }
 
-impl<N: NoiseSpec> ModelC<N> {
+impl<N: DriverSet> ModelC<N> {
     /// A visually striking parameter set: ε₄ = 0.06, λ = 3.19, no noise.
     #[must_use]
     pub fn classic() -> Self {
@@ -317,16 +317,20 @@ impl<N: NoiseSpec> ModelC<N> {
 // (multi-grain) path calls `apply_oriented`, a two-input stencil the
 // single-input `Stencil` trait cannot yet express — a known trait-surface
 // limitation. Axis-aligned Model C uses only the generic trait surface.
-impl<D, N: NoiseSpec> Model<CartesianGrid<2>, D> for ModelC<N>
+impl<D, N: DriverSet> Model<CartesianGrid<2>, D> for ModelC<N>
 where
     D: Discretizes<CartesianGrid<2>, AnisotropicDivergence, Stencil = KarmaRappelFlux>
         + Discretizes<CartesianGrid<2>, Laplacian>,
 {
     type Scalar = f64;
-    type Noise = N;
+    type Drivers = N;
 
     fn register_fields(&mut self, builder: &mut StateBuilder<f64>) {
-        self.phi = Some(builder.register("phi", 1));
+        // φ is the only field the (optional) Wiener driver moves: its
+        // amplitude buffer carries φ storage alone, so the stochastic
+        // term never pays u-sized traffic. Harmless under NoNoise, where
+        // the Wiener driver simply never runs.
+        self.phi = Some(builder.register_driven("phi", 1, &[Driver::Time, Driver::Wiener(0)]));
         self.u = Some(builder.register("u", 1));
         if self.orientations {
             // Static per-cell crystal orientation; ghost width 0 because

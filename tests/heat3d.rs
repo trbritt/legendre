@@ -40,7 +40,7 @@ where
     P: Discretizes<CartesianGrid<D>, Laplacian>,
 {
     type Scalar = f64;
-    type Noise = NoNoise;
+    type Drivers = NoNoise;
 
     fn register_fields(&mut self, builder: &mut StateBuilder<f64>) {
         self.u = Some(builder.register("u", 1));

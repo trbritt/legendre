@@ -72,7 +72,7 @@
 //!     P: Discretizes<CartesianGrid<D>, Laplacian>,
 //! {
 //!     type Scalar = f64;
-//!     type Noise = NoNoise; // deterministic: time is the only driver
+//!     type Drivers = NoNoise; // deterministic: time is the only driver
 //!
 //!     fn register_fields(&mut self, builder: &mut StateBuilder<f64>) {
 //!         self.u = Some(builder.register("u", 1)); // name + ghost width

@@ -25,6 +25,7 @@
 
 use crate::{
     core::{
+        driver::{Driver, DriverKind, DriverSet},
         scheduler::Scheduler,
         storage::{Allocator, Real, Scalar, StorageBackend},
     },
@@ -65,10 +66,12 @@ impl<T: Scalar> FieldHandle<T> {
 /// Declaration of one field.
 ///
 /// Bundles a name for observers/IO with the ghost-ring width the field's
-/// stencils require. `static_field` marks fields with zero time derivative
-/// (e.g. a grain-orientation map): they live in the state and in snapshot
-/// buffers, but tendency buffers allocate nothing for them and the
-/// vector-space operations skip them.
+/// stencils require and the field's **driver incidence**: the set of
+/// [`Driver`]s that move it. Every buffer-allocation and traffic question
+/// reduces to this one set — a *static* field (e.g. a grain-orientation
+/// map) is simply one moved by no driver: it lives in the state and in
+/// snapshot buffers, but per-driver tendency buffers allocate nothing for
+/// it and the vector-space operations skip it.
 #[derive(Debug, Clone)]
 pub struct FieldSpec {
     /// Field name, used by observers and IO backends as the column name.
@@ -76,8 +79,26 @@ pub struct FieldSpec {
     /// Ghost-ring width (the maximum stencil support of any operator applied
     /// to this field).
     pub ghost: u32,
-    /// Whether the field carries no time derivative (see type docs).
-    pub static_field: bool,
+    /// The drivers that move this field. Consulted only at allocation
+    /// time; per-driver buffers ([`State::like_for`]) carry storage for
+    /// exactly the fields a driver moves.
+    pub drivers: Vec<Driver>,
+}
+
+impl FieldSpec {
+    /// Whether `driver` moves this field.
+    #[inline]
+    #[must_use]
+    pub fn is_driven_by(&self, driver: Driver) -> bool {
+        self.drivers.contains(&driver)
+    }
+
+    /// Whether no driver moves this field (zero time derivative).
+    #[inline]
+    #[must_use]
+    pub const fn is_static(&self) -> bool {
+        self.drivers.is_empty()
+    }
 }
 
 /// Immutable description of a state's fields, shared (via `Arc`) by every
@@ -132,15 +153,37 @@ impl<T: Scalar> StateBuilder<T> {
         }
     }
 
-    /// Register a field by name with the given ghost-ring width and return
-    /// its typed handle.
+    /// Register a field moved by the time driver only (the common case:
+    /// pure drift dynamics) and return its typed handle.
     pub fn register(&mut self, name: &'static str, ghost: u32) -> FieldHandle<T> {
-        let index = self.specs.len();
-        self.specs.push(FieldSpec {
+        self.push(FieldSpec {
             name,
             ghost,
-            static_field: false,
-        });
+            drivers: vec![Driver::Time],
+        })
+    }
+
+    /// Register a field with its full driver incidence — every [`Driver`]
+    /// that moves it, [`Driver::Time`] included if the field has drift.
+    /// Per-driver buffers carry storage only for the fields a driver
+    /// moves, so declaring the incidence is what keeps a one-field noise
+    /// term from paying whole-state traffic.
+    pub fn register_driven(
+        &mut self,
+        name: &'static str,
+        ghost: u32,
+        drivers: &[Driver],
+    ) -> FieldHandle<T> {
+        self.push(FieldSpec {
+            name,
+            ghost,
+            drivers: drivers.to_vec(),
+        })
+    }
+
+    fn push(&mut self, spec: FieldSpec) -> FieldHandle<T> {
+        let index = self.specs.len();
+        self.specs.push(spec);
         FieldHandle {
             index,
             _marker: PhantomData,
@@ -154,23 +197,18 @@ impl<T: Scalar> StateBuilder<T> {
     /// memory: one static field on a 10080² grid is ~0.8 GB per buffer that
     /// stages would otherwise carry.
     pub fn register_static(&mut self, name: &'static str, ghost: u32) -> FieldHandle<T> {
-        let index = self.specs.len();
-        self.specs.push(FieldSpec {
+        self.push(FieldSpec {
             name,
             ghost,
-            static_field: true,
-        });
-        FieldHandle {
-            index,
-            _marker: PhantomData,
-        }
+            drivers: Vec::new(),
+        })
     }
 
     /// Allocate the state: the single up-front allocation of field memory.
     pub fn build<G: Grid, A: Allocator<T>>(self, grid: &G, alloc: &A) -> State<T, A::Storage> {
         let layout = Arc::new(StateLayout { specs: self.specs });
         let blocks = (0..grid.num_blocks())
-            .map(|b| BlockStorage::allocate(&layout, grid, BlockId(b as u32), alloc, true))
+            .map(|b| BlockStorage::allocate(&layout, grid, BlockId(b as u32), alloc, |_| true))
             .collect();
         State { layout, blocks }
     }
@@ -185,22 +223,24 @@ pub struct BlockStorage<T: Scalar, S: StorageBackend<T>> {
 }
 
 impl<T: Scalar, S: StorageBackend<T>> BlockStorage<T, S> {
+    /// Allocate one block's slabs; fields rejected by `keep` get
+    /// zero-length storage and are skipped by every vector-space operation.
     fn allocate<G: Grid, A: Allocator<T, Storage = S>>(
         layout: &StateLayout,
         grid: &G,
         block: BlockId,
         alloc: &A,
-        with_statics: bool,
+        keep: impl Fn(&FieldSpec) -> bool,
     ) -> Self {
         Self {
             fields: layout
                 .specs
                 .iter()
                 .map(|spec| {
-                    if spec.static_field && !with_statics {
-                        alloc.allocate(0)
-                    } else {
+                    if keep(spec) {
                         alloc.allocate(grid.block_len(block, spec.ghost))
+                    } else {
+                        alloc.allocate(0)
                     }
                 })
                 .collect(),
@@ -215,6 +255,17 @@ impl<T: Scalar, S: StorageBackend<T>> BlockStorage<T, S> {
             layout,
             fields: &mut self.fields,
             _marker: PhantomData,
+        }
+    }
+}
+
+impl<T: Real, S: StorageBackend<T>> BlockStorage<T, S> {
+    /// Zero every slab of this block. Lets a dispatch fuse "reset the
+    /// accumulator" with the work that fills it, instead of paying a
+    /// separate whole-buffer pass and barrier.
+    pub fn fill_zero(&mut self) {
+        for field in &mut self.fields {
+            field.as_mut_slice().fill(T::ZERO);
         }
     }
 }
@@ -244,32 +295,36 @@ impl<T: Scalar, S: StorageBackend<T>> State<T, S> {
     /// every field including statics (snapshot rings, stage *states*).
     #[must_use]
     pub fn like<G: Grid, A: Allocator<T, Storage = S>>(&self, grid: &G, alloc: &A) -> Self {
-        self.like_impl(grid, alloc, true)
+        self.like_impl(grid, alloc, |_| true)
     }
 
-    /// A congruent buffer for *tendencies* (dY/dt, noise amplitudes):
-    /// static fields get zero-length storage and are skipped by the
-    /// vector-space operations, so k-buffers never pay for fields that
-    /// cannot change.
+    /// A congruent *tendency* buffer for one driver: only the fields that
+    /// driver moves (see [`StateBuilder::register_driven`]) carry storage;
+    /// everything else gets a zero-length slab the vector-space operations
+    /// skip. `like_for(Driver::Time)` is the classic dY/dt buffer (static
+    /// fields excluded); `like_for(Driver::Wiener(j))` is driver `j`'s
+    /// amplitude buffer, so zeroing, amplitude evaluation, and increment
+    /// application touch exactly the driven fields' memory — a driver that
+    /// moves one field of a large system costs one field of traffic per
+    /// step.
     #[must_use]
-    pub fn like_tendency<G: Grid, A: Allocator<T, Storage = S>>(
+    pub fn like_for<G: Grid, A: Allocator<T, Storage = S>>(
         &self,
         grid: &G,
         alloc: &A,
+        driver: Driver,
     ) -> Self {
-        self.like_impl(grid, alloc, false)
+        self.like_impl(grid, alloc, |spec| spec.is_driven_by(driver))
     }
 
     fn like_impl<G: Grid, A: Allocator<T, Storage = S>>(
         &self,
         grid: &G,
         alloc: &A,
-        with_statics: bool,
+        keep: impl Fn(&FieldSpec) -> bool,
     ) -> Self {
         let blocks = (0..self.blocks.len())
-            .map(|b| {
-                BlockStorage::allocate(&self.layout, grid, BlockId(b as u32), alloc, with_statics)
-            })
+            .map(|b| BlockStorage::allocate(&self.layout, grid, BlockId(b as u32), alloc, &keep))
             .collect();
         Self {
             layout: Arc::clone(&self.layout),
@@ -377,39 +432,33 @@ fn block_copy<T: Real, S: StorageBackend<T>>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn block_add_wiener<T: Real, S: StorageBackend<T>, G: Grid>(
+fn block_apply_driver<T: Real, S: StorageBackend<T>, G: Grid>(
     grid: &G,
     layout: &StateLayout,
     mine: &mut BlockStorage<T, S>,
     amp: &BlockStorage<T, S>,
     block: BlockId,
-    scale: T,
+    driver: Driver,
+    dt: f64,
     seed: u64,
     salt: u64,
-    driver: usize,
 ) {
-    // One key stream per (seed, salt, driver, block); the per-cell id from
-    // Grid::cell_key is ghost-independent, so every field the driver moves
-    // receives the *same* deviate at the same cell — the broadcast that
-    // makes correlated multi-component dynamics expressible.
-    let block_key =
-        crate::util::rng::mix_key(seed, &[salt, driver as u64, block.index() as u64]);
+    // The driver's kernel owns the measure scaling (dt, √dt·ξ, …); the
+    // variant match happens here, once per slab — never per cell.
     for (f, (x, a)) in mine.fields.iter_mut().zip(&amp.fields).enumerate() {
         if x.is_empty() || a.is_empty() {
-            continue; // static field paired with a tendency buffer
+            continue; // field this buffer carries no storage for
         }
-        let ghost = layout.ghost(f);
-        for (i, (xi, ai)) in x.as_mut_slice().iter_mut().zip(a.as_slice()).enumerate() {
-            if *ai == T::ZERO {
-                continue;
-            }
-            let Some(cell) = grid.cell_key(block, ghost, i) else {
-                continue; // ghost entry: never receives noise
-            };
-            let key = crate::util::rng::splitmix64(block_key ^ cell);
-            let noise = T::from_f64(crate::util::rng::standard_normal(key));
-            *xi += scale * *ai * noise;
-        }
+        driver.apply_slab(
+            grid,
+            block,
+            layout.ghost(f),
+            dt,
+            seed,
+            salt,
+            a.as_slice(),
+            x.as_mut_slice(),
+        );
     }
 }
 
@@ -479,51 +528,107 @@ impl<T: Real, S: StorageBackend<T>> State<T, S> {
         );
     }
 
-    /// `self += scale · amplitude ∘ ξ` for one Wiener driver, where ξ is a
-    /// standard normal drawn per *cell* from the counter-based generator
-    /// keyed by `(seed, salt, driver, block, cell)` — deterministic and
-    /// schedule-independent (see [`crate::util::rng`]). The cell id comes
-    /// from [`Grid::cell_key`], so all fields moved by the driver receive
-    /// the same deviate at the same cell (the broadcast correlated systems
-    /// rely on). Zero-amplitude entries are skipped and ghost entries never
-    /// receive noise.
-    pub fn add_wiener<G: Grid>(
+    /// `self += dμ ∘ amplitude` for one driver: each slab goes through the
+    /// driver's kernel ([`DriverKind::apply_slab`]), which owns the
+    /// measure-correct scaling over a step of size `dt` — a plain `dt`
+    /// axpy for [`Driver::Time`], a per-cell `√dt·ξ` increment keyed by
+    /// `(seed, salt, stream, block, cell)` for [`Driver::Wiener`] —
+    /// deterministic and schedule-independent (see [`crate::util::rng`]).
+    /// The cell id comes from [`Grid::cell_key`], so all fields moved by a
+    /// stochastic driver receive the same increment at the same cell (the
+    /// broadcast correlated systems rely on); zero-amplitude and ghost
+    /// entries receive nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_driver<G: Grid>(
         &mut self,
         grid: &G,
         amplitude: &Self,
-        scale: T,
+        driver: Driver,
+        dt: f64,
         seed: u64,
         salt: u64,
-        driver: usize,
     ) {
         debug_assert!(Arc::ptr_eq(&self.layout, &amplitude.layout));
         for (b, (mine, amp)) in self.blocks.iter_mut().zip(&amplitude.blocks).enumerate() {
-            block_add_wiener(
+            block_apply_driver(
                 grid,
                 &self.layout,
                 mine,
                 amp,
                 BlockId(b as u32),
-                scale,
+                driver,
+                dt,
                 seed,
                 salt,
-                driver,
             );
         }
     }
 
-    /// Scheduler-driven [`State::add_wiener`]; identical results under any
-    /// scheduling because keys depend only on (driver, block, cell).
+    /// Apply one full explicit update — `self += dt·drift + Σᵢ dμᵢ ∘
+    /// stochastic[i]` — in a **single** scheduler dispatch: each block
+    /// work item applies the drift axpy and every stochastic driver's
+    /// kernel back-to-back while its slabs are cache-hot, instead of one
+    /// whole-state sweep (and barrier) per driver. `stochastic[i]` is the
+    /// amplitude buffer of `N::driver(i)`; results are bitwise identical
+    /// to applying the drivers one at a time.
     #[allow(clippy::too_many_arguments)]
-    pub fn add_wiener_with<G: Grid, Sch: Scheduler>(
+    pub fn apply_step_with<G: Grid, N: DriverSet, Sch: Scheduler>(
+        &mut self,
+        scheduler: &Sch,
+        grid: &G,
+        drift: &Self,
+        stochastic: &[Self],
+        dt: f64,
+        seed: u64,
+        salt: u64,
+    ) {
+        debug_assert!(Arc::ptr_eq(&self.layout, &drift.layout));
+        debug_assert_eq!(stochastic.len(), N::LEN);
+        let layout = &self.layout;
+        scheduler.for_each_block_mut(
+            &mut self.blocks,
+            || (),
+            |id, mine, ()| {
+                block_apply_driver(
+                    grid,
+                    layout,
+                    mine,
+                    &drift.blocks[id.index()],
+                    id,
+                    Driver::Time,
+                    dt,
+                    seed,
+                    salt,
+                );
+                for (i, amp) in stochastic.iter().enumerate() {
+                    block_apply_driver(
+                        grid,
+                        layout,
+                        mine,
+                        &amp.blocks[id.index()],
+                        id,
+                        N::driver(i),
+                        dt,
+                        seed,
+                        salt,
+                    );
+                }
+            },
+        );
+    }
+
+    /// Scheduler-driven [`State::apply_driver`]; identical results under
+    /// any scheduling because keys depend only on (driver, block, cell).
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_driver_with<G: Grid, Sch: Scheduler>(
         &mut self,
         scheduler: &Sch,
         grid: &G,
         amplitude: &Self,
-        scale: T,
+        driver: Driver,
+        dt: f64,
         seed: u64,
         salt: u64,
-        driver: usize,
     ) {
         debug_assert!(Arc::ptr_eq(&self.layout, &amplitude.layout));
         let layout = &self.layout;
@@ -531,16 +636,16 @@ impl<T: Real, S: StorageBackend<T>> State<T, S> {
             &mut self.blocks,
             || (),
             |id, mine, ()| {
-                block_add_wiener(
+                block_apply_driver(
                     grid,
                     layout,
                     mine,
                     &amplitude.blocks[id.index()],
                     id,
-                    scale,
+                    driver,
+                    dt,
                     seed,
                     salt,
-                    driver,
                 );
             },
         );

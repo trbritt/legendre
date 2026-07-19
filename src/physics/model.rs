@@ -16,10 +16,12 @@
 //!   [`Driver::Wiener`]). Stochastic calculus convention is **Itô**:
 //!   Wiener fields are evaluated at the pre-update state.
 //!
-//! - **Noise dimension is a type.** [`Model::Noise`] names the driver set
-//!   ([`NoNoise`] or [`Wiener<M>`]); integrators are implemented per driver
-//!   set, so pairing a deterministic-only scheme with a stochastic model is
-//!   a *compile error*, not a silently dropped term.
+//! - **The driver set is a type.** [`Model::Drivers`] names it ([`NoNoise`]
+//!   or [`Wiener<M>`]); integrators are implemented per driver set, so
+//!   pairing a deterministic-only scheme with a stochastic model is a
+//!   *compile error*, not a silently dropped term. Fields declare at
+//!   registration which drivers move them, and per-driver buffers carry
+//!   storage for exactly those fields.
 //!
 //! - **Correlated noise is model mathematics.** Drivers are independent by
 //!   construction (the framework draws one i.i.d. increment per cell per
@@ -52,49 +54,7 @@ use crate::{
     geometry::grid::{BlockId, Grid},
 };
 
-/// What multiplies a vector field in the dynamics: the deterministic clock
-/// or one of the model's independent Wiener processes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Driver {
-    /// The deterministic clock; this vector field is scaled by `dt`.
-    Time,
-    /// The `j`-th independent Wiener process (`j < M` for a model with
-    /// `Noise = Wiener<M>`); this vector field is scaled by
-    /// `ΔWⱼ = √dt·ξⱼ`, with ξⱼ drawn per cell from the counter-based
-    /// generator (see [`crate::util::rng`]).
-    Wiener(usize),
-}
-
-/// Type-level description of a model's driver set beyond time.
-///
-/// Implemented by the marker types [`NoNoise`] and [`Wiener<M>`]; models
-/// name one as [`Model::Noise`] and integrators are implemented per spec,
-/// which is what turns a model/integrator mismatch into a compile error.
-///
-/// The supertraits make every spec a trivial marker, so generic models can
-/// `derive(Clone, Debug)` while carrying a spec in `PhantomData`.
-pub trait NoiseSpec:
-    Copy + Clone + std::fmt::Debug + Default + Send + Sync + 'static
-{
-    /// Number of independent Wiener drivers.
-    const WIENER_DIM: usize;
-}
-
-/// Driver set of a deterministic model: time only.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoNoise;
-
-impl NoiseSpec for NoNoise {
-    const WIENER_DIM: usize = 0;
-}
-
-/// Driver set with `M` independent Wiener processes.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Wiener<const M: usize>;
-
-impl<const M: usize> NoiseSpec for Wiener<M> {
-    const WIENER_DIM: usize = M;
-}
+pub use crate::core::driver::{Driver, DriverKind, DriverSet, NoNoise, Wiener};
 
 /// Everything a model may consult while evaluating one block's vector
 /// field. Deliberately read-only and allocation-free.
@@ -115,10 +75,10 @@ pub trait Model<G: Grid, D>: Send + Sync {
     /// Arithmetic type of this model's fields.
     type Scalar: Real;
 
-    /// The driver set of this model's dynamics: [`NoNoise`] for a
-    /// deterministic system, [`Wiener<M>`] for one driven by `M`
-    /// independent Wiener processes.
-    type Noise: NoiseSpec;
+    /// The stochastic driver set of this model's dynamics (time is always
+    /// implicit): [`NoNoise`] for a deterministic system, [`Wiener<M>`]
+    /// for one driven by `M` independent Wiener processes.
+    type Drivers: DriverSet;
 
     /// Declare fields (name + ghost width = max stencil support) and stash
     /// the returned handles. Called exactly once, before allocation; the
@@ -149,14 +109,16 @@ pub trait Model<G: Grid, D>: Send + Sync {
     /// block's output.
     ///
     /// For [`Driver::Time`], write dY/dt into the interior cells of every
-    /// dynamic field (`out` arrives with unspecified contents, as models
-    /// overwrite it). For [`Driver::Wiener`], write the noise *amplitude*
-    /// Vⱼ(Y) into the interior cells of the driven fields only (`out`
-    /// arrives zeroed); the integrator supplies √dt·ξ with one deviate per
-    /// cell, broadcast across fields, so a driver shared by several fields
-    /// moves them with the *same* increment.
+    /// time-driven field (`out` arrives with unspecified contents, as
+    /// models overwrite it). For a stochastic driver, write the *amplitude*
+    /// Vⱼ(Y) into the interior cells of the fields registered as driven by
+    /// it (`out` arrives zeroed and carries storage only for those fields;
+    /// see [`StateBuilder::register_driven`]); the integrator applies the
+    /// driver's measure with one increment per cell, broadcast across
+    /// fields, so a driver shared by several fields moves them with the
+    /// *same* increment.
     ///
-    /// Models with `Noise = NoNoise` only ever receive [`Driver::Time`].
+    /// Models with `Drivers = NoNoise` only ever receive [`Driver::Time`].
     fn vector_field_block<S: StorageBackend<Self::Scalar>>(
         &self,
         driver: Driver,

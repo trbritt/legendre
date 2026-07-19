@@ -25,7 +25,7 @@ struct Cubic {
 
 impl<D: Sync> Model<CartesianGrid<1>, D> for Cubic {
     type Scalar = f64;
-    type Noise = NoNoise;
+    type Drivers = NoNoise;
 
     fn register_fields(&mut self, builder: &mut StateBuilder<f64>) {
         self.u = Some(builder.register("u", 0)); // no stencil, no ghosts
@@ -76,7 +76,10 @@ fn error(integrator: impl Integrator<CartesianGrid<1>, (), NoNoise>, dt: f64) ->
 }
 
 /// Observed order p from halving dt: p = log2(e(dt)/e(dt/2)).
-fn observed_order(integrator: impl Integrator<CartesianGrid<1>, (), NoNoise> + Copy, dt: f64) -> f64 {
+fn observed_order(
+    integrator: impl Integrator<CartesianGrid<1>, (), NoNoise> + Copy,
+    dt: f64,
+) -> f64 {
     (error(integrator, dt) / error(integrator, dt / 2.0)).log2()
 }
 
