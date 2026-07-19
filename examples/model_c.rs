@@ -34,7 +34,10 @@ use legendre::{
         parquet::ParquetObserver,
         progress::{FieldStat, FieldStatsSink, ProgressObserver, progress_bar},
     },
-    physics::phasefield::{Grain, ModelC},
+    physics::{
+        model::{DriverSet, NoNoise, Wiener},
+        phasefield::{Grain, ModelC},
+    },
     util::rng::{mix_key, unit_open},
 };
 use std::error::Error;
@@ -46,7 +49,7 @@ const H: f64 = 0.4;
 enum Scheme {
     /// Euler–Maruyama: first-order drift, √dt-correct noise.
     Em,
-    /// Classic RK4 drift; noise handled as in Euler–Maruyama.
+    /// Classic RK4 drift; deterministic only (pair --noise with em).
     Rk4,
 }
 
@@ -103,8 +106,21 @@ struct Args {
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     match args.integrator {
-        Scheme::Rk4 => run(RungeKutta4 { seed: args.seed }, &args),
-        Scheme::Em => run(EulerMaruyama { seed: args.seed }, &args),
+        // The driver contract makes RK4 deterministic-only at the type
+        // level; a stochastic run must pair --noise with Euler–Maruyama.
+        Scheme::Rk4 => {
+            if args.noise != 0.0 {
+                return Err("--integrator rk4 is deterministic-only; use em with --noise".into());
+            }
+            run::<NoNoise, _>(RungeKutta4, &args)
+        }
+        // Zero amplitude means the model *has no Wiener driver*: select the
+        // NoNoise instantiation so the run pays nothing for the absent term
+        // (exactly what the pre-driver `has_noise()` runtime gate did).
+        Scheme::Em if args.noise == 0.0 => {
+            run::<NoNoise, _>(EulerMaruyama { seed: args.seed }, &args)
+        }
+        Scheme::Em => run::<Wiener<1>, _>(EulerMaruyama { seed: args.seed }, &args),
     }
 }
 
@@ -141,9 +157,10 @@ fn seed_positions(args: &Args) -> Vec<Grain> {
         .collect()
 }
 
-fn run<I>(integrator: I, args: &Args) -> Result<(), Box<dyn Error>>
+fn run<N, I>(integrator: I, args: &Args) -> Result<(), Box<dyn Error>>
 where
-    I: Integrator<CartesianGrid<2>, FiniteVolume> + 'static,
+    N: DriverSet,
+    I: Integrator<CartesianGrid<2>, FiniteVolume, N> + 'static,
 {
     let grid = CartesianGrid::new(
         [args.cells, args.cells],
@@ -151,7 +168,7 @@ where
         [0.0, 0.0],
         [H, H],
     )?;
-    let mut model = ModelC::classic();
+    let mut model = ModelC::<N>::classic();
     if args.orient {
         model = model.with_orientations();
     }

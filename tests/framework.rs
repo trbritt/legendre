@@ -10,6 +10,7 @@
 
 use legendre::{
     core::{
+        driver::Driver,
         state::{State, StateBuilder},
         storage::{DenseStorage, SystemAllocator},
     },
@@ -165,7 +166,7 @@ mod state_ops {
     #[test]
     fn tendency_buffers_carry_no_static_storage() {
         let (grid, state, dynamic, static_f) = two_field_state();
-        let tendency = state.like_tendency(&grid, &SystemAllocator);
+        let tendency = state.like_for(&grid, &SystemAllocator, Driver::Time);
         assert_eq!(tendency.slab(BlockId(0), static_f).len(), 0);
         assert_eq!(tendency.slab(BlockId(0), dynamic).len(), 4);
         // Full buffers carry everything.
@@ -173,10 +174,30 @@ mod state_ops {
         assert_eq!(full.slab(BlockId(0), static_f).len(), 4);
     }
 
+    /// Per-driver buffers are sparse: only the fields a driver moves carry
+    /// storage, so a one-field noise term never pays whole-state traffic.
+    #[test]
+    fn driver_buffers_carry_only_driven_fields() {
+        let grid = CartesianGrid::new([4], [4], [0.0], [1.0]).unwrap();
+        let mut builder = StateBuilder::<f64>::new();
+        let drift_only = builder.register("drift_only", 0);
+        let noisy = builder.register_driven("noisy", 0, &[Driver::Time, Driver::Wiener(0)]);
+        let state: DenseState = builder.build(&grid, &SystemAllocator);
+
+        // The Wiener buffer carries the noisy field alone…
+        let amp = state.like_for(&grid, &SystemAllocator, Driver::Wiener(0));
+        assert_eq!(amp.slab(BlockId(0), drift_only).len(), 0);
+        assert_eq!(amp.slab(BlockId(0), noisy).len(), 4);
+        // …while the Time buffer carries both.
+        let k = state.like_for(&grid, &SystemAllocator, Driver::Time);
+        assert_eq!(k.slab(BlockId(0), drift_only).len(), 4);
+        assert_eq!(k.slab(BlockId(0), noisy).len(), 4);
+    }
+
     #[test]
     fn axpy_and_noise_skip_static_fields() {
         let (grid, mut state, dynamic, static_f) = two_field_state();
-        let mut tendency = state.like_tendency(&grid, &SystemAllocator);
+        let mut tendency = state.like_for(&grid, &SystemAllocator, Driver::Time);
         tendency.slab_mut(BlockId(0), dynamic).fill(2.0);
 
         state.axpy(10.0, &tendency);
@@ -188,11 +209,11 @@ mod state_ops {
         });
 
         // Noise with unit amplitude on the dynamic field only.
-        let mut amp = state.like_tendency(&grid, &SystemAllocator);
+        let mut amp = state.like_for(&grid, &SystemAllocator, Driver::Time);
         amp.slab_mut(BlockId(0), dynamic).fill(1.0);
         let before_static: Vec<f64> = state.slab(BlockId(0), static_f).to_vec();
         let before_dynamic: Vec<f64> = state.slab(BlockId(0), dynamic).to_vec();
-        state.add_noise(&amp, 1.0, 42, 0);
+        state.apply_driver(&grid, &amp, Driver::Wiener(0), 1.0, 42, 0);
         assert_eq!(
             state.slab(BlockId(0), static_f),
             &before_static[..],
@@ -208,11 +229,59 @@ mod state_ops {
     #[test]
     fn zero_amplitude_entries_receive_no_noise() {
         let (grid, mut state, dynamic, _) = two_field_state();
-        let amp = state.like_tendency(&grid, &SystemAllocator); // all zero
+        let amp = state.like_for(&grid, &SystemAllocator, Driver::Time); // all zero
         let before: Vec<f64> = state.slab(BlockId(0), dynamic).to_vec();
-        state.add_noise(&amp, 1.0, 42, 0);
+        state.apply_driver(&grid, &amp, Driver::Wiener(0), 1.0, 42, 0);
         assert_eq!(state.slab(BlockId(0), dynamic), &before[..]);
-        let _ = grid;
+    }
+
+    /// The driver-broadcast contract: one Wiener increment per (cell,
+    /// driver), identical across every field the driver moves — even when
+    /// the fields' slab layouts differ (different ghost widths) — and
+    /// ghost entries never receive noise. Distinct drivers use distinct
+    /// increment streams.
+    #[test]
+    fn wiener_increments_broadcast_per_cell_across_fields() {
+        let grid = CartesianGrid::new([4], [4], [0.0], [1.0]).unwrap();
+        let mut builder = StateBuilder::<f64>::new();
+        let a = builder.register("a", 0);
+        let b = builder.register("b", 2); // different ghost width than a
+        let mut state: DenseState = builder.build(&grid, &SystemAllocator);
+
+        // Unit amplitude everywhere, ghost entries of b included: the
+        // cell-key gate (not the zero-amplitude gate) must keep ghosts
+        // noise-free.
+        let mut amp = state.like_for(&grid, &SystemAllocator, Driver::Time);
+        amp.slab_mut(BlockId(0), a).fill(1.0);
+        amp.slab_mut(BlockId(0), b).fill(1.0);
+
+        state.apply_driver(&grid, &amp, Driver::Wiener(0), 1.0, 42, 3);
+        let va = state.view(&grid, BlockId(0), a);
+        let vb = state.view(&grid, BlockId(0), b);
+        for_each_interior([4], |idx| {
+            assert_ne!(va.get(idx), 0.0, "interior cells receive noise");
+            assert_eq!(
+                va.get(idx),
+                vb.get(idx),
+                "same driver, same cell ⇒ same increment on every field"
+            );
+        });
+        for k in [-2isize, -1, 4, 5] {
+            assert_eq!(vb.get([k]), 0.0, "ghost entries receive no noise");
+        }
+
+        // A different driver index draws from a different stream.
+        let mut other = state.like(&grid, &SystemAllocator);
+        other.fill_zero();
+        other.apply_driver(&grid, &amp, Driver::Wiener(1), 1.0, 42, 3);
+        let vo = other.view(&grid, BlockId(0), a);
+        let mut all_equal = true;
+        for_each_interior([4], |idx| {
+            if vo.get(idx) != va.get(idx) {
+                all_equal = false;
+            }
+        });
+        assert!(!all_equal, "drivers must have independent streams");
     }
 
     #[test]

@@ -6,19 +6,22 @@ use crate::{
         storage::{Real, StorageBackend},
     },
     geometry::grid::Grid,
-    integrators::{Integrator, StageLayout, eval_rhs},
-    physics::model::Model,
+    integrators::{Integrator, StageKind, StageLayout, eval_drift},
+    physics::model::{Driver, Model, NoNoise},
 };
 
 /// Explicit forward Euler: `Y ← Y + dt·f(Y, t)`.
+///
+/// Deterministic models only; for a stochastic system use
+/// [`EulerMaruyama`](crate::integrators::EulerMaruyama), which degenerates
+/// to this scheme when the model has no Wiener drivers.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ForwardEuler;
 
-impl<G: Grid, D: Sync> Integrator<G, D> for ForwardEuler {
+impl<G: Grid, D: Sync> Integrator<G, D, NoNoise> for ForwardEuler {
     fn stage_layout(&self) -> StageLayout {
         StageLayout {
-            tendency: 1,
-            stage_state: 0,
+            stages: vec![StageKind::Tendency(Driver::Time)],
         }
     }
 
@@ -34,12 +37,12 @@ impl<G: Grid, D: Sync> Integrator<G, D> for ForwardEuler {
         t: f64,
         dt: f64,
     ) where
-        M: Model<G, D>,
+        M: Model<G, D, Drivers = NoNoise>,
         S: StorageBackend<M::Scalar>,
         Sch: Scheduler,
     {
         let k = &mut stages[0];
-        eval_rhs(model, grid, disc, scheduler, pool, state, k, t);
+        eval_drift(model, grid, disc, scheduler, pool, state, k, t);
         state.axpy_with(scheduler, M::Scalar::from_f64(dt), k);
     }
 }

@@ -6,7 +6,7 @@
 //! Euler must reproduce the discrete decay factor
 //! `(1 − dt·κ·λ)ⁿ, λ = (2 − 2cos(kx·h))/h²` to rounding error. This pins the
 //! whole chain: `Simulation` → `Integrator` → `Scheduler` →
-//! `Model::rhs_block` → `Discretizes` → `Stencil` → views → `axpy`.
+//! `Model::vector_field_block` → `Discretizes` → `Stencil` → views → `axpy`.
 
 use legendre::{
     core::{
@@ -26,7 +26,7 @@ use legendre::{
         grid::{BlockId, Grid},
     },
     integrators::{ForwardEuler, Integrator, RungeKutta4},
-    physics::model::{Model, RhsContext},
+    physics::model::{Driver, Model, NoNoise, RhsContext},
 };
 
 /// Isotropic heat equation on a 2D Cartesian grid, generic over any
@@ -41,6 +41,7 @@ where
     D: Discretizes<CartesianGrid<2>, Laplacian>,
 {
     type Scalar = f64;
+    type Drivers = NoNoise;
 
     fn register_fields(&mut self, builder: &mut StateBuilder<f64>) {
         self.u = Some(builder.register("u", 1));
@@ -55,8 +56,9 @@ where
         fill_ghosts_mirror(grid, state, self.u.unwrap());
     }
 
-    fn rhs_block<S: StorageBackend<f64>>(
+    fn vector_field_block<S: StorageBackend<f64>>(
         &self,
+        _driver: Driver,
         ctx: &RhsContext<'_, CartesianGrid<2>, D>,
         state: &State<f64, S>,
         out: &mut BlockStateMut<'_, f64, S>,
@@ -90,7 +92,7 @@ fn run_heat<Sch, I>(
 ) -> (Vec<f64>, Vec<f64>, [usize; 2])
 where
     Sch: Scheduler,
-    I: Integrator<CartesianGrid<2>, FiniteDifference>,
+    I: Integrator<CartesianGrid<2>, FiniteDifference, NoNoise>,
 {
     const N: usize = 32;
     let h = 0.1;
@@ -160,7 +162,7 @@ fn heat_matches_discrete_eigenmode_decay() {
 
 #[test]
 fn rk4_matches_discrete_eigenmode_decay() {
-    let (got, expected, _) = run_heat(SerialScheduler, RungeKutta4::default(), 200, rk4_factor);
+    let (got, expected, _) = run_heat(SerialScheduler, RungeKutta4, 200, rk4_factor);
     for (g, e) in got.iter().zip(&expected) {
         approx::assert_relative_eq!(g, e, max_relative = 1e-10, epsilon = 1e-12);
     }
@@ -175,7 +177,7 @@ fn parallel_scheduler_is_bitwise_identical_to_serial() {
 
 #[test]
 fn rk4_parallel_is_bitwise_identical_to_serial() {
-    let (serial, _, _) = run_heat(SerialScheduler, RungeKutta4::default(), 100, rk4_factor);
-    let (parallel, _, _) = run_heat(RayonScheduler, RungeKutta4::default(), 100, rk4_factor);
+    let (serial, _, _) = run_heat(SerialScheduler, RungeKutta4, 100, rk4_factor);
+    let (parallel, _, _) = run_heat(RayonScheduler, RungeKutta4, 100, rk4_factor);
     assert_eq!(serial, parallel, "scheduling must not change results");
 }

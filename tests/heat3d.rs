@@ -24,7 +24,7 @@ use legendre::{
         grid::{BlockId, Grid},
     },
     integrators::ForwardEuler,
-    physics::model::{Model, RhsContext},
+    physics::model::{Driver, Model, NoNoise, RhsContext},
 };
 
 /// Isotropic heat equation, generic over spatial dimension: the model code
@@ -40,6 +40,7 @@ where
     P: Discretizes<CartesianGrid<D>, Laplacian>,
 {
     type Scalar = f64;
+    type Drivers = NoNoise;
 
     fn register_fields(&mut self, builder: &mut StateBuilder<f64>) {
         self.u = Some(builder.register("u", 1));
@@ -54,8 +55,9 @@ where
         fill_ghosts_mirror(grid, state, self.u.unwrap());
     }
 
-    fn rhs_block<S: StorageBackend<f64>>(
+    fn vector_field_block<S: StorageBackend<f64>>(
         &self,
+        _driver: Driver,
         ctx: &RhsContext<'_, CartesianGrid<D>, P>,
         state: &State<f64, S>,
         out: &mut BlockStateMut<'_, f64, S>,

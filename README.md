@@ -1,11 +1,22 @@
+<div align="center">
+
+<img src="https://raw.githubusercontent.com/trbritt/legendre/main/assets/legendre.png" width="320" alt="A solidification front computed with legendre: solid phase advancing into an undercooled melt, the interface glowing at the phase boundary">
+
 # legendre
 
 [![CI](https://github.com/trbritt/legendre/actions/workflows/ci.yml/badge.svg)](https://github.com/trbritt/legendre/actions/workflows/ci.yml)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/trbritt/legendre)
 [![crates.io](https://img.shields.io/crates/v/legendre.svg)](https://crates.io/crates/legendre)
 [![docs.rs](https://docs.rs/legendre/badge.svg)](https://docs.rs/legendre)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 **A block-structured, deterministic, scheduler-driven PDE simulation framework in Rust.**
+
+<sub>The image is real output, not artwork: a Karma–Rappel Model C solidification
+front from <code>examples/model_c</code>, rendered with
+<code>scripts/render_model_c.py</code>.</sub>
+
+</div>
 
 `legendre` solves systems of time-dependent partial differential equations — deterministic or stochastic, in any spatial dimension — on block-decomposed structured grids, with zero-cost abstractions separating the *mathematics* (models, operators) from the *numerics* (discretization policies, integrators) from the *execution* (schedulers, storage, observation).
 
@@ -72,8 +83,8 @@ Every object has exactly one owner and one responsibility:
         │        │          │          │           │         │
     Scheduler  State      Grid   Discretization  Model   Integrator
         │        │          │          │           │         │
-        │    ┌───┴───┐   Blocks    Stencils     rhs(Y,t)  stages,
-     blocks  │Storage│      │          │        b(Y) noise  axpy
+        │    ┌───┴───┐   Blocks    Stencils     V₀(Y,t)   stages,
+     blocks  │Storage│      │          │        Vⱼ(Y) noise axpy
       → CPU  │ Views │   topology  operators                 │
              └───────┘                                       │
         ┌────────────┐                                       │
@@ -156,10 +167,10 @@ The policy pattern in one picture:
         │                                                   │
         │  for each stage:                                  │
         │    Model::fill_ghosts(grid, state, t_stage)       │  halos + BCs
-        │    Scheduler::for_each_block ──► Model::rhs_block │  parallel, disjoint
+        │    Scheduler::for_each_block ──► vector fields    │  parallel, disjoint
         │                                                   │
         │  combine stages:  state.axpy_with(scheduler, …)   │  pure vector algebra
-        │  stochastic term: state += √dt · b(Y) ∘ ξ         │  counter-based ξ
+        │  stochastic term: state += Σⱼ √dt · Vⱼ(Y) ∘ ξⱼ    │  counter-based ξ
         └───────────────────────────────────────────────────┘
         │
         ▼
@@ -168,7 +179,7 @@ The policy pattern in one picture:
 
 Because every state-shaped buffer (integrator stages, RHS accumulators, noise amplitudes) is **slab-congruent** with the state, integrators are grid-, dimension-, and scheme-agnostic vector algebra. RK4 is ~40 lines.
 
-**The √dt lives in the integrator, not the model.** Models write noise *amplitudes* b(Y); the integrator applies the increment with correct Euler–Maruyama scaling. Scaling noise by `dt` instead of `√dt` — a classic bug in hand-rolled stochastic solvers — is *inexpressible* here.
+**Dynamics are driver-indexed vector fields.** A model is `dY = V₀(Y,t)·dt + Σⱼ Vⱼ(Y,t)·dWⱼ`: one `vector_field_block(driver, …)` evaluates the field conjugate to the time driver or to any of the model's independent Wiener drivers, and the model's driver set is a *type* (`NoNoise`, `Wiener<M>`). The √dt lives in the integrator, not the model; scaling noise by `dt` instead of `√dt` — a classic bug in hand-rolled stochastic solvers — is *inexpressible* here. So is pairing a deterministic-only scheme with a stochastic model: `RungeKutta4` implements `Integrator<G, D, NoNoise>` only, so that mistake is a compile error. Correlated components need nothing from the framework — drivers are independent by construction, and a model expresses correlation by mixing drivers across its fields (the Cholesky factor is model mathematics).
 
 ---
 
@@ -177,7 +188,7 @@ Because every state-shaped buffer (integrator stages, RHS accumulators, noise am
 Reproducibility is a design constraint, not an aspiration:
 
 - **Scheduling-independence.** Block writes are disjoint and land at fixed slab locations; the test suite asserts serial and Rayon runs are **bitwise identical** — including stochastic runs.
-- **Counter-based noise.** There is no RNG stream to advance. Every random increment is a pure function of `(seed, step, block, field, cell)` via a SplitMix64 chain + Box–Muller. Any worker, any thread count, any execution order: identical noise. Reproducing a run requires only its seed.
+- **Counter-based noise.** There is no RNG stream to advance. Every random increment is a pure function of `(seed, step, driver, block, cell)` via a SplitMix64 chain + Box–Muller. Any worker, any thread count, any execution order: identical noise. Reproducing a run requires only its seed.
 - **Fixed-order reductions** (planned, see roadmap) will extend the same guarantee to inner products for the implicit stack.
 
 ---
@@ -234,7 +245,7 @@ Live progress via `indicatif`:
 
 ## Quick start
 
-A complete model — the D-dimensional heat equation — lives in the crate-root docs and compiles as a doctest; the same pattern at full scale is `examples/heat3d.rs`. Defining a model means implementing `register_fields`, `fill_ghosts`, and `rhs_block`; everything else (parallelism, stage buffers, output) is wiring:
+A complete model — the D-dimensional heat equation — lives in the crate-root docs and compiles as a doctest; the same pattern at full scale is `examples/heat3d.rs`. Defining a model means implementing `register_fields`, `fill_ghosts`, and `vector_field_block`; everything else (parallelism, stage buffers, output) is wiring:
 
 ```rust
 let grid = CartesianGrid::new([96; 3], [32; 3], [0.0; 3], [0.1; 3])?;
@@ -327,11 +338,11 @@ For maximum throughput: `--profile maxperf` (fat LTO, single codegen unit) + `RU
 
 ## Scope: what this framework can and cannot solve
 
-Honesty section. The trait surface was audited against PDE classes beyond the ones implemented; here is the map.
+There's a few limitations of the current design, and some ideas for next steps.
 
 ### Current Solutions Scope
 
-Any method-of-lines system **∂Y/∂t = F(Y, ∇Y, ∇²Y, …, x, t) + b(Y)·ξ** where F is evaluable cell-locally from a ghost-filled neighborhood:
+Any method-of-lines system **∂Y/∂t = F(Y, ∇Y, ∇²Y, …, x, t) + Σⱼ Vⱼ(Y)·ξⱼ** where F is evaluable cell-locally from a ghost-filled neighborhood:
 
 - **Parabolic:** heat, diffusion, reaction–diffusion (Gray–Scott, FitzHugh–Nagumo, …)
 - **Phase-field:** Allen–Cahn, dendritic solidification (shipped), Cahn–Hilliard (biharmonic = ghost width 2, already supported per-field)

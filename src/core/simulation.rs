@@ -17,8 +17,8 @@ use crate::{
         storage::Allocator,
     },
     geometry::grid::Grid,
-    integrators::Integrator,
-    physics::model::Model,
+    integrators::{Integrator, StageKind},
+    physics::model::{DriverSet, Model},
 };
 
 /// Sole owner of every simulation component; see the module docs.
@@ -26,7 +26,7 @@ pub struct Simulation<G, D, M, I, Sch, A>
 where
     G: Grid,
     M: Model<G, D>,
-    I: Integrator<G, D>,
+    I: Integrator<G, D, M::Drivers>,
     Sch: Scheduler,
     A: Allocator<M::Scalar>,
 {
@@ -48,20 +48,42 @@ impl<G, D, M, I, Sch, A> Simulation<G, D, M, I, Sch, A>
 where
     G: Grid,
     M: Model<G, D>,
-    I: Integrator<G, D>,
+    I: Integrator<G, D, M::Drivers>,
     Sch: Scheduler,
     A: Allocator<M::Scalar>,
 {
     /// Register the model's fields, allocate state and stage buffers, and
     /// assemble. The only allocating path in a simulation's lifetime.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the model declares a stochastic driver that no field is
+    /// registered as driven by — that term would silently apply to
+    /// nothing (see [`StateBuilder::register_driven`]).
     pub fn new(grid: G, disc: D, mut model: M, integrator: I, scheduler: Sch, alloc: A) -> Self {
         let mut builder = StateBuilder::new();
         model.register_fields(&mut builder);
         let state = builder.build(&grid, &alloc);
-        let layout = integrator.stage_layout();
-        let stages = (0..layout.tendency)
-            .map(|_| state.like_tendency(&grid, &alloc))
-            .chain((0..layout.stage_state).map(|_| state.like(&grid, &alloc)))
+        for i in 0..<M::Drivers as DriverSet>::LEN {
+            let driver = <M::Drivers as DriverSet>::driver(i);
+            assert!(
+                state
+                    .layout()
+                    .specs()
+                    .iter()
+                    .any(|spec| spec.is_driven_by(driver)),
+                "model declares stochastic driver {driver:?} but no field is registered \
+                 as driven by it; use StateBuilder::register_driven"
+            );
+        }
+        let stages = integrator
+            .stage_layout()
+            .stages
+            .iter()
+            .map(|kind| match *kind {
+                StageKind::Tendency(driver) => state.like_for(&grid, &alloc, driver),
+                StageKind::State => state.like(&grid, &alloc),
+            })
             .collect();
         let pool = ScratchPool::allocate(
             model.scratch_spec(&grid),

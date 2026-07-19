@@ -1,6 +1,7 @@
 //! Framework core: state, storage, scheduling, scratch, observation, and the
 //! simulation owner. Everything here is grid- and physics-agnostic.
 
+pub mod driver;
 pub mod observer;
 pub mod scheduler;
 pub mod scratch;

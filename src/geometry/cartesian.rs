@@ -381,6 +381,28 @@ impl<const D: usize> Grid for CartesianGrid<D> {
         out
     }
 
+    fn cell_key(&self, _block: BlockId, ghost: u32, offset: usize) -> Option<u64> {
+        // Undo the dimension-0-fastest linearization over the ghosted box,
+        // reject ghost coordinates, and re-linearize over the interior so
+        // the id is independent of this field's ghost width.
+        let g = ghost as usize;
+        let mut rem = offset;
+        let mut key = 0usize;
+        let mut stride = 1usize;
+        for d in 0..D {
+            let ghosted = self.block_cells[d] + 2 * g;
+            let c = rem % ghosted;
+            rem /= ghosted;
+            if c < g || c >= self.block_cells[d] + g {
+                return None;
+            }
+            key += (c - g) * stride;
+            stride *= self.block_cells[d];
+        }
+        debug_assert_eq!(rem, 0, "slab offset out of range");
+        Some(key as u64)
+    }
+
     fn view<'a, T: Scalar>(
         &'a self,
         block: BlockId,

@@ -1,6 +1,6 @@
 [package]
 name = "legendre"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.91.0"
 authors = ["Tristan Britt <hello@tbritt.xyz>"]
@@ -12,7 +12,7 @@ homepage = "https://github.com/trbritt/legendre"
 readme = "README.md"
 keywords = ["pde", "simulation", "phase-field", "stencil", "hpc"]
 categories = ["science", "simulation", "mathematics", "concurrency"]
-exclude = [".github/*", ".idea/*", "benches/*", "data/*"]
+exclude = [".github/*", ".idea/*", "assets/*", "data/*"]
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6", optional = true }
@@ -21,21 +21,26 @@ tikv-jemallocator = { version = "0.6", optional = true }
 indicatif = { version = "0.17", default-features = false }
 parking_lot = { version = "0.12.5", default-features = false, features = ["arc_lock", "hardware-lock-elision"] }
 parquet = { version = "59.1.0", default-features = false, features = ["snap"] }
+pprof = { version = "0.13.0", features = ["flamegraph"], optional = true }
 rayon = { version = "1.12.0", default-features = false, features = ["web_spin_lock"] }
 thiserror = { version = "2.0.18", default-features = false }
 tokio = { version = "1.52.3", default-features = false, features = ["macros", "sync", "time", "rt-multi-thread"] }
 tracing = { version = "0.1.44", features = ["async-await", "release_max_level_info"] }
-pprof = { version = "0.13.0", features = ["flamegraph"], optional = true }
 
 [dev-dependencies]
 approx = { version = "0.5.1" }
 clap = { version = "4.5", features = ["derive"] }
+criterion = { version = "5.0.1", package = "codspeed-criterion-compat" }
 tempfile = { version = "3.20" }
 
 [features]
 default = []
 dev-profiling = ["pprof"]
 jemalloc = ["tikv-jemallocator"]
+
+[[bench]]
+name = "core"
+harness = false
 
 [[example]]
 name = "heat3d"
