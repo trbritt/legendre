@@ -233,7 +233,7 @@ Live progress via `indicatif`:
 
 | Layer | Shipped today |
 |---|---|
-| **Geometry** | `CartesianGrid<const D>` (uniform, block-tiled, any dimension), signed ghost indexing, dimension-sweep halo exchange with mirror (no-flux) physical boundaries |
+| **Geometry** | `CartesianGrid<const D>` (uniform, block-tiled, any dimension, per-dimension periodic wrap via `with_periodic`), signed ghost indexing, dimension-sweep halo exchange with mirror (no-flux) physical boundaries on non-periodic faces, `fill_from_fn` declarative initial conditions |
 | **Discretization** | `FiniteDifference` (central, 2nd order), `FiniteVolume` (Karma–Rappel anisotropic flux divergence); operator tags `Laplacian`, `Gradient`, `Divergence`, `AnisotropicDivergence` |
 | **Integrators** | `ForwardEuler`, `EulerMaruyama` (√dt-correct stochastic), `RungeKutta4` (O(dt⁴) drift, composable with noise) |
 | **Models** | `ModelC` — Karma–Rappel dendritic solidification: coupled φ/u, 4-fold anisotropy, multi-grain nucleation with **per-grain crystallographic orientation** (static θ₀(x) field via nearest-seed Voronoi; anisotropy evaluated as A(θ − θ₀)); O(cells + blocks·grains) initialization |
@@ -314,6 +314,7 @@ Every layer is pinned by an *exactness* test, not a tolerance hand-wave:
 | 3D heat conservation | mirror BCs + stencil are exactly conservative | Σu constant to all printed digits over 1050 steps |
 | Solidification physics | the shipped phase-field model | φ stays in its wells, seed grows, latent heat bounded by the melting point |
 | Halo exchange / mirror BCs | exact ghost values, every layer, cross-block and boundary | cell-exact assertions |
+| Periodic boundaries | topology-level wrap: exact ghosts (multi-block, self-wrap, corners) + periodic eigenmode decay | cell-exact + 1e-10 relative |
 | Static-field layout | tendency buffers skip zero-tendency fields | zero-length slabs; axpy/noise leave statics bit-identical |
 | Parquet round-trip | the on-disk snapshot contract | doubles round-trip bit-for-bit; row order matches the static file |
 | Async pipeline | delivery, ring recycling, drain-on-shutdown | exact snapshot schedule received; `finish()` runs |
@@ -358,7 +359,6 @@ Any method-of-lines system **∂Y/∂t = F(Y, ∇Y, ∇²Y, …, x, t) + Σⱼ V
 | **Incompressible Navier–Stokes, quasi-static elasticity** | the implicit stack above (pressure projection / global solve) | models-as-bounds pattern unchanged |
 | **IMEX splitting** for stiff reactions | optional stiff/non-stiff RHS split on `Model` | default method, existing models unaffected |
 | **Adaptive CFL** (advection-dominated) | `stable_dt` currently cannot see the state; needs the same reductions | optional `stable_dt_state` method |
-| **Periodic boundaries** | periodicity flags in `CartesianGrid::face_neighbor` | small, local |
 | **AMR** | quadtree/octree grids behind the same `Grid` GAT-view contract | designed-for from day one: blocks are the refinement unit; stencils own coarse–fine interfaces |
 
 ### Outside the Current Architecture
