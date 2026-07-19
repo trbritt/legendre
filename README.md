@@ -1,11 +1,22 @@
+<div align="center">
+
+<img src="https://raw.githubusercontent.com/trbritt/legendre/main/assets/legendre.png" width="320" alt="A solidification front computed with legendre: solid phase advancing into an undercooled melt, the interface glowing at the phase boundary">
+
 # legendre
 
 [![CI](https://github.com/trbritt/legendre/actions/workflows/ci.yml/badge.svg)](https://github.com/trbritt/legendre/actions/workflows/ci.yml)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/trbritt/legendre)
 [![crates.io](https://img.shields.io/crates/v/legendre.svg)](https://crates.io/crates/legendre)
 [![docs.rs](https://docs.rs/legendre/badge.svg)](https://docs.rs/legendre)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 **A block-structured, deterministic, scheduler-driven PDE simulation framework in Rust.**
+
+<sub>The image is real output, not artwork: a Karma–Rappel Model C solidification
+front from <code>examples/model_c</code>, rendered with
+<code>scripts/render_model_c.py</code>.</sub>
+
+</div>
 
 `legendre` solves systems of time-dependent partial differential equations — deterministic or stochastic, in any spatial dimension — on block-decomposed structured grids, with zero-cost abstractions separating the *mathematics* (models, operators) from the *numerics* (discretization policies, integrators) from the *execution* (schedulers, storage, observation).
 
