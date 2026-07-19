@@ -338,7 +338,7 @@ For maximum throughput: `--profile maxperf` (fat LTO, single codegen unit) + `RU
 
 ## Scope: what this framework can and cannot solve
 
-Honesty section. The trait surface was audited against PDE classes beyond the ones implemented; here is the map.
+There's a few limitations of the current design, and some ideas for next steps.
 
 ### Current Solutions Scope
 
