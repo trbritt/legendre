@@ -1,4 +1,4 @@
-//! CodSpeed benchmarks for the `legendre` PDE framework.
+//! `CodSpeed` benchmarks for the `legendre` PDE framework.
 //!
 //! These benchmarks exercise the full solver hot path — `Simulation::step`
 //! driving `Integrator` → `Scheduler` → `Model::rhs_block` → `Discretizes` →
