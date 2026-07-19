@@ -6,9 +6,12 @@
 //! Everything runs on `SerialScheduler`: `CodSpeed` measures instruction
 //! counts, and single-threaded execution keeps them deterministic.
 
-// `criterion_group!` holds its `Criterion` to the end of `main`; the
-// "tighten this drop" suggestion cannot apply inside the macro expansion.
+// `criterion_group!` holds its `Criterion` to the end of `main` (the
+// "tighten this drop" suggestion cannot apply inside the macro expansion)
+// and generates an undocumentable `fn benches`; neither lint is
+// meaningful for a bench harness.
 #![allow(clippy::significant_drop_tightening)]
+#![allow(missing_docs)]
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use legendre::{
