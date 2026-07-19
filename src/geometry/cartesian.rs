@@ -121,6 +121,12 @@ impl<const D: usize> CartesianGrid<D> {
         self.cells
     }
 
+    /// Physical coordinate of the domain's lower corner.
+    #[must_use]
+    pub const fn origin(&self) -> [f64; D] {
+        self.origin
+    }
+
     /// Interior cells per dimension of one block.
     #[must_use]
     pub const fn block_cells(&self) -> [usize; D] {
@@ -206,6 +212,19 @@ pub struct CartesianView<'a, T: Scalar, const D: usize> {
     ghost: u32,
 }
 
+impl<'a, T: Scalar, const D: usize> CartesianView<'a, T, D> {
+    /// Wrap a ghost-inclusive slab of a uniform box (used by every grid
+    /// family whose blocks are uniform boxes — Cartesian and AMR patches).
+    #[inline(always)]
+    pub(crate) const fn from_raw(data: &'a [T], interior: [usize; D], ghost: u32) -> Self {
+        Self {
+            data,
+            interior,
+            ghost,
+        }
+    }
+}
+
 impl<T: Scalar, const D: usize> CartesianView<'_, T, D> {
     /// Value at `idx` (ghost cells addressable with negative indices).
     #[inline(always)]
@@ -233,6 +252,18 @@ pub struct CartesianViewMut<'a, T: Scalar, const D: usize> {
     data: &'a mut [T],
     interior: [usize; D],
     ghost: u32,
+}
+
+impl<'a, T: Scalar, const D: usize> CartesianViewMut<'a, T, D> {
+    /// Mutable counterpart of [`CartesianView::from_raw`].
+    #[inline(always)]
+    pub(crate) const fn from_raw_mut(data: &'a mut [T], interior: [usize; D], ghost: u32) -> Self {
+        Self {
+            data,
+            interior,
+            ghost,
+        }
+    }
 }
 
 impl<T: Scalar, const D: usize> CartesianViewMut<'_, T, D> {

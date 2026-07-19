@@ -379,7 +379,7 @@ where
             if let Some(theta_h) = self.theta {
                 // Multi-grain path: anisotropy in each grain's crystal frame.
                 let theta = state.view(grid, block, theta_h);
-                flux.apply_oriented(grid, block, phi, theta, &mut dphi);
+                flux.apply_oriented(grid.spacing(block), phi, theta, &mut dphi);
                 for_each_interior(phi.interior(), |idx| {
                     let p = phi.get(idx);
                     let g_prime = (p * p).mul_add(p, -p);
