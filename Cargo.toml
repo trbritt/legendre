@@ -30,6 +30,7 @@ pprof = { version = "0.13.0", features = ["flamegraph"], optional = true }
 [dev-dependencies]
 approx = { version = "0.5.1" }
 clap = { version = "4.5", features = ["derive"] }
+divan = { version = "5.0.1", package = "codspeed-divan-compat" }
 tempfile = { version = "3.20" }
 
 [features]
@@ -44,6 +45,10 @@ path = "examples/heat3d.rs"
 [[example]]
 name = "model_c"
 path = "examples/model_c.rs"
+
+[[bench]]
+name = "heat"
+harness = false
 
 [lints.rust]
 unsafe_code = "allow"

@@ -3,6 +3,7 @@
 [![CI](https://github.com/trbritt/legendre/actions/workflows/ci.yml/badge.svg)](https://github.com/trbritt/legendre/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/legendre.svg)](https://crates.io/crates/legendre)
 [![docs.rs](https://docs.rs/legendre/badge.svg)](https://docs.rs/legendre)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/trbritt/legendre?utm_source=badge)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 **A block-structured, deterministic, scheduler-driven PDE simulation framework in Rust.**
