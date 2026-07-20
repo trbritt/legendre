@@ -224,7 +224,7 @@ where
             new_levels.pop();
         }
 
-        if hierarchy_unchanged(grid, &new_levels) {
+        if hierarchy_acceptable(grid, &new_levels) {
             return None;
         }
         let new_grid = AmrGrid::from_patches(grid.base().clone(), grid.ratios(), &new_levels)
@@ -260,26 +260,65 @@ fn push_cells<const D: usize>(bx: &CellBox<D>, out: &mut Vec<[i64; D]>) {
     }
 }
 
-/// Whether the proposed refined levels equal the grid's current ones
-/// (as sets — clustering order is irrelevant).
-fn hierarchy_unchanged<const D: usize>(grid: &AmrGrid<D>, new_levels: &[Vec<CellBox<D>>]) -> bool {
+/// Whether the current hierarchy may keep serving the proposed one:
+/// same level count, every proposed box already covered by the current
+/// level, and the current level not over-refined beyond 3/2 the proposal.
+/// Berger–Oliger: "once we have good clusters they do not change very
+/// fast" — threshold flicker must not force a rebuild (with its
+/// migration, reallocation, and stochastic re-keying) every cadence.
+fn hierarchy_acceptable<const D: usize>(
+    grid: &AmrGrid<D>,
+    new_levels: &[Vec<CellBox<D>>],
+) -> bool {
     if new_levels.len() != grid.num_levels() - 1 {
         return false;
     }
-    for (l, boxes) in new_levels.iter().enumerate() {
-        let mut current: Vec<CellBox<D>> = grid
+    for (l, proposed) in new_levels.iter().enumerate() {
+        let current: Vec<CellBox<D>> = grid
             .blocks_at((l + 1) as u8)
             .map(|b| grid.patch(b).bx)
             .collect();
-        let mut proposed = boxes.clone();
-        current.sort_unstable();
-        proposed.sort_unstable();
-        if current != proposed {
-            return false;
+        let proposed_cells: u64 = proposed.iter().map(CellBox::cells).sum();
+        let current_cells: u64 = current.iter().map(CellBox::cells).sum();
+        if current_cells > proposed_cells + proposed_cells / 2 {
+            return false; // over-refined: rebuild to shrink
+        }
+        for bx in proposed {
+            if !box_covered(bx, &current) {
+                return false; // the feature escaped the current patches
+            }
         }
     }
     true
 }
+
+/// Whether every cell of `need` lies in some box of `cover` (run-skipping
+/// walk along axis 0; regrid-cadence cost, never per step).
+fn box_covered<const D: usize>(need: &CellBox<D>, cover: &[CellBox<D>]) -> bool {
+    if need.cells() == 0 {
+        return true;
+    }
+    let mut c = need.lo;
+    loop {
+        match cover.iter().find(|b| b.contains(c)) {
+            None => return false,
+            Some(b) => c[0] = b.hi[0] - 1,
+        }
+        let mut d = 0;
+        loop {
+            c[d] += 1;
+            if c[d] < need.hi[d] {
+                break;
+            }
+            c[d] = need.lo[d];
+            d += 1;
+            if d == D {
+                return true;
+            }
+        }
+    }
+}
+
 
 /// Copy the old solution onto the new hierarchy: level 0 verbatim (the
 /// base tiling never changes), refined cells from the same-level old

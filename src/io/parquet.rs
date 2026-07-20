@@ -317,15 +317,20 @@ where
     S: StorageBackend<f64>,
 {
     fn observe(&mut self, step: u64, t: f64, epoch: u64, grid: &G, state: &State<f64, S>) {
-        if epoch != self.epoch {
-            // A regrid happened: adopt the new geometry; the next snapshot
-            // lazily emits the new epoch's static file.
+        if step != 1 && !step.is_multiple_of(self.every) {
+            // Note the epoch even when skipping, but clone the (possibly
+            // large) grid only when a snapshot will actually be written —
+            // regrids can be far more frequent than snapshots.
+            if epoch != self.epoch {
+                self.epoch = epoch;
+                self.static_written = false;
+            }
+            return;
+        }
+        if epoch != self.epoch || !self.static_written {
             self.grid = grid.clone();
             self.epoch = epoch;
             self.static_written = false;
-        }
-        if step != 1 && !step.is_multiple_of(self.every) {
-            return;
         }
         if let Err(e) = self.write_snapshot(step, t, state) {
             tracing::error!(step, "parquet snapshot failed: {e:#}");

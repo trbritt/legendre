@@ -63,6 +63,25 @@ fn for_each_cell<const D: usize>(bx: &CellBox<D>, mut f: impl FnMut([i64; D])) {
     }
 }
 
+/// Visit every cell of the ghost ring of `bx` grown by `g`: per axis, the
+/// two strips normal to it — earlier axes span the grown range, later
+/// axes the interior — a disjoint, complete cover that never touches the
+/// interior.
+fn for_each_ring_cell<const D: usize>(bx: &CellBox<D>, g: i64, mut f: impl FnMut([i64; D])) {
+    for d in 0..D {
+        for (lo_d, hi_d) in [(bx.lo[d] - g, bx.lo[d]), (bx.hi[d], bx.hi[d] + g)] {
+            let mut strip = *bx;
+            for e in 0..d {
+                strip.lo[e] = bx.lo[e] - g;
+                strip.hi[e] = bx.hi[e] + g;
+            }
+            strip.lo[d] = lo_d;
+            strip.hi[d] = hi_d;
+            for_each_cell(&strip, &mut f);
+        }
+    }
+}
+
 /// Inject fine solutions onto the coarse cells beneath them: each covered
 /// coarse cell becomes the mean of its `r^D` fine children. Runs finest →
 /// coarsest so multi-level chains propagate all the way down.
@@ -119,6 +138,10 @@ pub fn fill_ghosts_mirror<T: Real, S: StorageBackend<T>, const D: usize>(
     if ghost == 0 {
         return;
     }
+    // Gather-then-write with ring-only iteration: ghost cells are a
+    // perimeter, so never scan the grown *box* (an area) to find them,
+    // and batch all writes through one mutable view per patch.
+    let mut gathered: Vec<([isize; D], T)> = Vec::new();
     for level in 0..grid.num_levels() as u8 {
         debug_assert!(
             level == 0 || u64::from(ghost) <= u64::from(grid.ratios()[level as usize - 1]),
@@ -128,10 +151,8 @@ pub fn fill_ghosts_mirror<T: Real, S: StorageBackend<T>, const D: usize>(
         let domain = grid.level_domain(level);
         for pb in grid.blocks_at(level) {
             let p = *grid.patch(pb);
-            for_each_cell(&p.bx.grown(i64::from(ghost)), |cell| {
-                if p.bx.contains(cell) {
-                    return;
-                }
+            gathered.clear();
+            for_each_ring_cell(&p.bx, i64::from(ghost), |cell| {
                 // Physical mirror: reflect out-of-domain coordinates.
                 let target: [i64; D] = std::array::from_fn(|d| {
                     if cell[d] < domain.lo[d] {
@@ -157,8 +178,12 @@ pub fn fill_ghosts_mirror<T: Real, S: StorageBackend<T>, const D: usize>(
                     },
                 );
                 let local: [isize; D] = std::array::from_fn(|d| (cell[d] - p.bx.lo[d]) as isize);
-                state.view_mut(grid, pb, handle).set(local, value);
+                gathered.push((local, value));
             });
+            let mut v = state.view_mut(grid, pb, handle);
+            for &(local, value) in &gathered {
+                v.set(local, value);
+            }
         }
     }
 }

@@ -62,6 +62,11 @@ pub struct AmrGrid<const D: usize> {
     level_spacing: Vec<[f64; D]>,
     /// `level_start[l]..level_start[l+1]` are level `l`'s patch indices.
     level_start: Vec<u32>,
+    /// Per populated level: cell → owning patch (`u32::MAX` = uncovered),
+    /// linearized dimension-0-fastest over the level domain. Ghost fill,
+    /// prolongation, and migration do O(1) lookups instead of scanning
+    /// patch lists per cell.
+    lookup: Vec<Vec<u32>>,
 }
 
 impl<const D: usize> AmrGrid<D> {
@@ -167,12 +172,26 @@ impl<const D: usize> AmrGrid<D> {
             level_spacing.push(std::array::from_fn(|d| prev[d] / f64::from(r)));
         }
 
+        // Paint the per-level ownership maps (construction/regrid only).
+        let mut lookup = Vec::with_capacity(level_start.len() - 1);
+        for level in 0..level_start.len() - 1 {
+            let domain = level_domain(&base, &ratios, level as u8);
+            let extent: [usize; D] = std::array::from_fn(|d| domain.hi[d] as usize);
+            let mut map = vec![u32::MAX; extent.iter().product()];
+            for pid in level_start[level]..level_start[level + 1] {
+                let bx = patches[pid as usize].bx;
+                paint(&mut map, &extent, &bx, pid);
+            }
+            lookup.push(map);
+        }
+
         Ok(Self {
             base,
             ratios,
             patches,
             level_spacing,
             level_start,
+            lookup,
         })
     }
 
@@ -243,11 +262,23 @@ impl<const D: usize> AmrGrid<D> {
         (start..end).map(BlockId)
     }
 
-    /// The level-`level` patch containing `cell`, if any.
+    /// The level-`level` patch containing `cell`, if any. O(1): a lookup
+    /// in the level's precomputed ownership map.
     #[must_use]
     pub fn find_patch(&self, level: u8, cell: [i64; D]) -> Option<BlockId> {
-        self.blocks_at(level)
-            .find(|&b| self.patch(b).bx.contains(cell))
+        let map = self.lookup.get(level as usize)?;
+        let domain = self.level_domain(level);
+        if !domain.contains(cell) {
+            return None;
+        }
+        let mut off = 0usize;
+        let mut stride = 1usize;
+        for (c, hi) in cell.iter().zip(&domain.hi) {
+            off += *c as usize * stride;
+            stride *= *hi as usize;
+        }
+        let pid = map[off];
+        (pid != u32::MAX).then_some(BlockId(pid))
     }
 }
 
@@ -260,6 +291,38 @@ fn level_domain<const D: usize>(base: &CartesianGrid<D>, ratios: &[u32], level: 
     CellBox {
         lo: [0; D],
         hi: std::array::from_fn(|d| cells[d] as i64 * scale),
+    }
+}
+
+/// Paint `bx`'s cells with `pid` in a dimension-0-fastest map of `extent`.
+fn paint<const D: usize>(map: &mut [u32], extent: &[usize; D], bx: &CellBox<D>, pid: u32) {
+    if (0..D).any(|d| bx.lo[d] >= bx.hi[d]) {
+        return;
+    }
+    let mut c = bx.lo;
+    loop {
+        let mut off = 0usize;
+        let mut stride = 1usize;
+        for d in 0..D {
+            off += c[d] as usize * stride;
+            stride *= extent[d];
+        }
+        // Runs along axis 0 are contiguous: fill the whole row at once.
+        let run = (bx.hi[0] - bx.lo[0]) as usize;
+        map[off..off + run].fill(pid);
+        c[0] = bx.hi[0] - 1;
+        let mut d = 0;
+        loop {
+            c[d] += 1;
+            if c[d] < bx.hi[d] {
+                break;
+            }
+            c[d] = bx.lo[d];
+            d += 1;
+            if d == D {
+                return;
+            }
+        }
     }
 }
 
