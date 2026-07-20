@@ -895,3 +895,91 @@ mod adaptive {
         }
     }
 }
+
+/// The flagship physics under adaptivity: Model C's interface is tracked
+/// by |∇φ| tagging, stays physical, and keeps the refinement partial.
+mod model_c_adaptive {
+    use super::*;
+    use legendre::{
+        discretization::finite_volume::FiniteVolume,
+        geometry::{
+            amr::{BergerOliger, ClusterParams, GradientTagger, RegridPolicy},
+            cartesian::for_each_interior,
+        },
+        integrators::EulerMaruyama,
+        physics::phasefield::ModelC,
+    };
+
+    #[test]
+    fn dendrite_interface_is_tracked_by_refinement() {
+        let base = CartesianGrid::new([48, 48], [24, 24], [0.0, 0.0], [0.4, 0.4]).unwrap();
+        let grid = AmrGrid::from_patches(base, &[2], &[]).unwrap();
+        let mut sim = Simulation::adaptive(
+            grid,
+            FiniteVolume::default(),
+            ModelC::<NoNoise>::classic(),
+            EulerMaruyama { seed: 7 },
+            SerialScheduler,
+            SystemAllocator,
+            BergerOliger::new(
+                GradientTagger {
+                    field: "phi",
+                    threshold: 0.15,
+                },
+                RegridPolicy {
+                    every: 4,
+                    buffer: 2,
+                    cluster: ClusterParams {
+                        efficiency: 0.8,
+                        min_width: 4,
+                    },
+                },
+            ),
+        );
+        let dt = sim.stable_dt().unwrap();
+        let phi_h = sim.model().phi();
+        {
+            let model = sim.model().clone();
+            let (grid, state) = sim.state_mut();
+            model.initialize(grid.base(), state, [0.4, 0.4], 4.0, 0.7);
+        }
+        for _ in 0..150 {
+            sim.step(dt);
+        }
+
+        let g = sim.grid();
+        assert_eq!(g.num_levels(), 2, "the interface must be refined");
+        let refined: u64 = g.blocks_at(1).map(|b| g.patch(b).bx.cells()).sum();
+        assert!(
+            refined > 0 && refined < 96 * 96,
+            "refinement must be partial: {refined} fine cells"
+        );
+
+        // Every level-0 interface cell (per the tagging criterion) sits
+        // under a fine patch, and the solution stays physical everywhere.
+        for b in 0..g.num_blocks() {
+            let block = BlockId(b as u32);
+            let level = g.level(block);
+            let p = *g.patch(block);
+            let v = sim.state().view(g, block, phi_h);
+            for_each_interior(p.extent(), |idx| {
+                let x = v.get(idx);
+                assert!(x.is_finite() && x.abs() < 1.2, "unphysical phi {x}");
+                if level == 0 {
+                    let gx = 0.5 * (v.get([idx[0] + 1, idx[1]]) - v.get([idx[0] - 1, idx[1]]));
+                    let gy = 0.5 * (v.get([idx[0], idx[1] + 1]) - v.get([idx[0], idx[1] - 1]));
+                    if gx.abs().max(gy.abs()) > 0.2 {
+                        let fine = [
+                            (p.bx.lo[0] + idx[0] as i64) * 2,
+                            (p.bx.lo[1] + idx[1] as i64) * 2,
+                        ];
+                        assert!(
+                            g.find_patch(1, fine).is_some(),
+                            "interface cell {fine:?} not refined"
+                        );
+                    }
+                }
+            });
+        }
+    }
+}

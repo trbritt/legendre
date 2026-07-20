@@ -61,6 +61,9 @@ impl<G, T: Scalar, S: StorageBackend<T>, A> Adapt<G, T, S, A> for Static {
     }
 }
 
+/// The boxed observer list of a simulation (see [`Observer`]).
+type Observers<G, T, S> = Vec<Box<dyn Observer<G, T, S>>>;
+
 /// Sole owner of every simulation component; see the module docs.
 pub struct Simulation<G, D, M, I, Sch, A, R = Static>
 where
@@ -81,9 +84,10 @@ where
     state: State<M::Scalar, A::Storage>,
     stages: Vec<State<M::Scalar, A::Storage>>,
     pool: ScratchPool<M::Scalar, A::Storage>,
-    observers: Vec<Box<dyn Observer<M::Scalar, A::Storage>>>,
+    observers: Observers<G, M::Scalar, A::Storage>,
     t: f64,
     step_index: u64,
+    epoch: u64,
 }
 
 impl<G, D, M, I, Sch, A> Simulation<G, D, M, I, Sch, A>
@@ -173,6 +177,7 @@ where
             observers: Vec::new(),
             t: 0.0,
             step_index: 0,
+            epoch: 0,
         }
     }
 
@@ -195,9 +200,15 @@ where
             .collect()
     }
 
-    /// Register an observer to be notified after every completed step.
-    pub fn attach_observer(&mut self, observer: Box<dyn Observer<M::Scalar, A::Storage>>) {
+    /// Register an observer to be notified after every completed step
+    /// with the current grid and epoch.
+    pub fn attach_observer(&mut self, observer: Box<dyn Observer<G, M::Scalar, A::Storage>>) {
         self.observers.push(observer);
+    }
+
+    /// Grid generation: 0 at construction, +1 per adaptive regrid.
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// The grid this simulation runs on.
@@ -247,6 +258,7 @@ where
         {
             self.grid = grid;
             self.state = state;
+            self.epoch += 1;
             self.stages =
                 Self::build_stages(&self.integrator, &self.state, &self.grid, &self.alloc);
             self.pool = ScratchPool::allocate(
@@ -269,7 +281,7 @@ where
         self.t += dt;
         self.step_index += 1;
         for obs in &mut self.observers {
-            obs.observe(self.step_index, self.t, &self.state);
+            obs.observe(self.step_index, self.t, self.epoch, &self.grid, &self.state);
         }
     }
 

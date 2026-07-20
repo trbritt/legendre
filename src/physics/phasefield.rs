@@ -30,6 +30,7 @@ use crate::{
         stencil::Stencil,
     },
     geometry::{
+        amr::{self, AmrGrid},
         cartesian::{CartesianGrid, fill_ghosts_mirror, for_each_interior},
         grid::{BlockId, Grid},
     },
@@ -317,13 +318,19 @@ impl<N: DriverSet> ModelC<N> {
 // (multi-grain) path calls `apply_oriented`, a two-input stencil the
 // single-input `Stencil` trait cannot yet express — a known trait-surface
 // limitation. Axis-aligned Model C uses only the generic trait surface.
-impl<D, N: DriverSet> Model<CartesianGrid<2>, D> for ModelC<N>
-where
-    D: Discretizes<CartesianGrid<2>, AnisotropicDivergence, Stencil = KarmaRappelFlux>
-        + Discretizes<CartesianGrid<2>, Laplacian>,
-{
-    type Scalar = f64;
-    type Drivers = N;
+//
+// The impl is macro-parameterized over the grid family: the physics body
+// is written once (views are the same concrete type on both grids); only
+// ghost filling and the stable-dt spacing source differ.
+macro_rules! model_c_impl {
+    ($grid:ty, $fill:item, $stable:item) => {
+        impl<D, N: DriverSet> Model<$grid, D> for ModelC<N>
+        where
+            D: Discretizes<$grid, AnisotropicDivergence, Stencil = KarmaRappelFlux>
+                + Discretizes<$grid, Laplacian>,
+        {
+            type Scalar = f64;
+            type Drivers = N;
 
     fn register_fields(&mut self, builder: &mut StateBuilder<f64>) {
         // φ is the only field the (optional) Wiener driver moves: its
@@ -341,20 +348,12 @@ where
         }
     }
 
-    fn fill_ghosts<S: StorageBackend<f64>>(
-        &self,
-        grid: &CartesianGrid<2>,
-        state: &mut State<f64, S>,
-        _t: f64,
-    ) {
-        fill_ghosts_mirror(grid, state, self.phi());
-        fill_ghosts_mirror(grid, state, self.u());
-    }
+    $fill
 
     fn vector_field_block<S: StorageBackend<f64>>(
         &self,
         driver: Driver,
-        ctx: &RhsContext<'_, CartesianGrid<2>, D>,
+        ctx: &RhsContext<'_, $grid, D>,
         state: &State<f64, S>,
         out: &mut BlockStateMut<'_, f64, S>,
         _scratch: &mut Scratch<f64, S>,
@@ -422,6 +421,22 @@ where
         });
     }
 
+    $stable
+        }
+    };
+}
+
+model_c_impl!(
+    CartesianGrid<2>,
+    fn fill_ghosts<S: StorageBackend<f64>>(
+        &self,
+        grid: &CartesianGrid<2>,
+        state: &mut State<f64, S>,
+        _t: f64,
+    ) {
+        fill_ghosts_mirror(grid, state, self.phi());
+        fill_ghosts_mirror(grid, state, self.u());
+    },
     /// dt = 0.2·h²/D — deliberately *below* the model's 0.25·h²/D. That
     /// choice sits exactly on the 2D limit of the 5-point thermal update,
     /// where the grid-scale checkerboard mode has amplification −1
@@ -432,4 +447,29 @@ where
         let [hx, hy] = grid.spacing(BlockId(0));
         Some(0.2 * hx.min(hy).powi(2) / self.d_thermal)
     }
-}
+);
+
+model_c_impl!(
+    AmrGrid<2>,
+    fn fill_ghosts<S: StorageBackend<f64>>(
+        &self,
+        grid: &AmrGrid<2>,
+        state: &mut State<f64, S>,
+        _t: f64,
+    ) {
+        // Berger–Oliger synchronization before every evaluation sweep:
+        // fine data wins beneath patches (restriction), then ghosts —
+        // same-level exchange, physical mirror, coarse→fine prolongation.
+        amr::restrict(grid, state, self.phi());
+        amr::restrict(grid, state, self.u());
+        amr::fill_ghosts_mirror(grid, state, self.phi());
+        amr::fill_ghosts_mirror(grid, state, self.u());
+    },
+    /// The Cartesian stability bound evaluated at the finest spacing the
+    /// hierarchy's ratio capacity allows: a global-dt adaptive run must
+    /// remain stable when a regrid populates its finest level mid-run.
+    fn stable_dt(&self, grid: &AmrGrid<2>) -> Option<f64> {
+        let [hx, hy] = grid.finest_spacing();
+        Some(0.2 * hx.min(hy).powi(2) / self.d_thermal)
+    }
+);

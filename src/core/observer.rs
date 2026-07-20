@@ -32,10 +32,16 @@ use crate::core::{
 };
 
 /// The solver-facing observation contract.
-pub trait Observer<T: Scalar, S: StorageBackend<T>>: Send {
+///
+/// `observe` receives the *current* grid and its epoch (0 at construction,
+/// +1 per adaptive regrid), so geometry-writing observers can follow grid
+/// changes by re-emitting statics when the epoch bumps. Observers that
+/// don't care about geometry (progress bars, the async snapshot ring)
+/// implement the trait generically over `G` and ignore both arguments.
+pub trait Observer<G, T: Scalar, S: StorageBackend<T>>: Send {
     /// Called after each completed step. Must not block on IO; copy what you
     /// need and hand off.
-    fn observe(&mut self, step: u64, t: f64, state: &State<T, S>);
+    fn observe(&mut self, step: u64, t: f64, epoch: u64, grid: &G, state: &State<T, S>);
 }
 
 /// A consumer of snapshots, run on the observer runtime — free to do slow,
@@ -131,8 +137,11 @@ impl<T: Real, S: StorageBackend<T> + 'static> AsyncObserver<T, S> {
     }
 }
 
-impl<T: Real, S: StorageBackend<T> + 'static> Observer<T, S> for AsyncObserver<T, S> {
-    fn observe(&mut self, step: u64, t: f64, state: &State<T, S>) {
+/// Grid-agnostic: the preallocated snapshot ring assumes a fixed block
+/// structure, so the async pipeline serves uniform/static grids; adaptive
+/// runs use synchronous grid-aware observers instead.
+impl<G, T: Real, S: StorageBackend<T> + 'static> Observer<G, T, S> for AsyncObserver<T, S> {
+    fn observe(&mut self, step: u64, t: f64, _epoch: u64, _grid: &G, state: &State<T, S>) {
         if step != 1 && !step.is_multiple_of(self.every) {
             return;
         }

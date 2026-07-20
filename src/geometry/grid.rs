@@ -116,3 +116,13 @@ pub trait Grid: Send + Sync + 'static {
         data: &'a mut [T],
     ) -> Self::ViewMut<'a, T>;
 }
+
+/// Grid families whose blocks are axis-aligned boxes of cells.
+///
+/// The accessor IO sinks and other family-generic glue need to iterate a
+/// block's interior without knowing the concrete grid type; both the
+/// uniform Cartesian grid and AMR patch hierarchies implement it.
+pub trait BoxedBlocks<const D: usize>: Grid<Point = [f64; D], Index = [isize; D]> {
+    /// Interior cells per dimension of one block.
+    fn block_extent(&self, block: BlockId) -> [usize; D];
+}

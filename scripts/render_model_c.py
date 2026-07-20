@@ -4,12 +4,18 @@
 Reads the snapshot format written by ``legendre::io::parquet::ParquetObserver``:
 
     run_dir/
-    |-- static_<epoch>.parquet   x, y[, z] + static fields (e.g. theta0)
+    |-- static_<epoch>.parquet   x, y[, z], level, patch + static fields
     `-- snap_<step>.parquet      step, t, epoch + dynamic fields
 
 Static files carry the coordinates (and any time-invariant fields) once per
 grid epoch; snapshots are joined to them by row order. 3D runs are rendered
 as the mid-plane slice normal to z.
+
+AMR runs are composited finest-wins: every cell paints an
+(h_level / h_finest)^2 pixel block on the finest-level lattice, coarse
+levels first — a uniform grid is just the single-level case of the same
+path. Adaptive runs write one static file per regrid epoch; each frame uses
+its snapshot's epoch. Pass --patches to outline refined patches.
 
 Typical usage (after `python3 -m venv .venv && .venv/bin/pip install -r
 scripts/requirements.txt`):
@@ -70,8 +76,11 @@ class GridIndex:
     """Maps the writer's row order onto a dense (ny, nx) image grid.
 
     Row order is block-major and dimension-0 fastest, so rows are *not* in
-    raster order; instead of assuming the layout, scatter values through the
-    coordinates, which is exact for any block decomposition.
+    raster order; instead of assuming the layout, values are painted through
+    their coordinates, which is exact for any block decomposition. Under AMR
+    every cell paints an (h_level / h_finest)^2 pixel block on the
+    finest-level lattice, coarse levels first (finest wins); a uniform grid
+    is the single-level case of the same path.
     """
 
     def __init__(self, static_path: Path):
@@ -80,8 +89,20 @@ class GridIndex:
         x = table["x"].to_numpy()
         y = table["y"].to_numpy()
         self.is_3d = "z" in self.columns
+        level = (
+            table["level"].to_numpy().astype(int)
+            if "level" in self.columns
+            else np.zeros(len(x), dtype=int)
+        )
+        patch = (
+            table["patch"].to_numpy().astype(int)
+            if "patch" in self.columns
+            else np.zeros(len(x), dtype=int)
+        )
 
         if self.is_3d:
+            if level.max() > 0:
+                fail("3D AMR rendering is not supported yet")
             # Mid-plane slice: keep rows whose z is the unique value closest
             # to the domain midpoint.
             z = table["z"].to_numpy()
@@ -89,29 +110,61 @@ class GridIndex:
             z_mid = zs[len(zs) // 2]
             self.mask = z == z_mid
             self.z_mid = z_mid
-            x, y = x[self.mask], y[self.mask]
+            x, y, level, patch = x[self.mask], y[self.mask], level[self.mask], patch[self.mask]
         else:
             self.mask = slice(None)
 
-        self.xs = np.unique(x)
-        self.ys = np.unique(y)
-        self.extent = (
-            float(self.xs[0]),
-            float(self.xs[-1]),
-            float(self.ys[0]),
-            float(self.ys[-1]),
-        )
-        self.ix = np.searchsorted(self.xs, x)
-        self.iy = np.searchsorted(self.ys, y)
-        self.shape = (len(self.ys), len(self.xs))
+        # Per-level spacing from that level's own coordinate lattice.
+        levels = np.unique(level)
+        spacing = {}
+        for lv in levels:
+            xs_l = np.unique(x[level == lv])
+            spacing[lv] = float(np.min(np.diff(xs_l))) if len(xs_l) > 1 else 1.0
+        h_fine = spacing[levels.max()]
+
+        # Domain edges from cell centers +- h/2, then the finest lattice.
+        half = np.array([spacing[lv] / 2.0 for lv in level])
+        lo_x, hi_x = float(np.min(x - half)), float(np.max(x + half))
+        lo_y, hi_y = float(np.min(y - half)), float(np.max(y + half))
+        nx = round((hi_x - lo_x) / h_fine)
+        ny = round((hi_y - lo_y) / h_fine)
+        self.extent = (lo_x, hi_x, lo_y, hi_y)
+        self.shape = (ny, nx)
+
+        # Painting order: coarse first, so finer levels overwrite.
+        self.order = np.argsort(level, kind="stable")
+        lvo = level[self.order]
+        # Pixel-block origin and size per (ordered) cell.
+        k = np.array([round(spacing[lv] / h_fine) for lv in lvo])
+        self.k = k
+        self.ix0 = np.round((x[self.order] - half[self.order] - lo_x) / h_fine).astype(int)
+        self.iy0 = np.round((y[self.order] - half[self.order] - lo_y) / h_fine).astype(int)
+
+        # Patch outlines (levels >= 1) for --patches.
+        self.patch_boxes = []
+        for lv in levels:
+            if lv == 0:
+                continue
+            for pid in np.unique(patch[level == lv]):
+                sel = (level == lv) & (patch == pid)
+                h = spacing[lv]
+                x0, x1 = float(np.min(x[sel]) - h / 2), float(np.max(x[sel]) + h / 2)
+                y0, y1 = float(np.min(y[sel]) - h / 2), float(np.max(y[sel]) + h / 2)
+                self.patch_boxes.append((int(lv), x0, y0, x1 - x0, y1 - y0))
+
         self.statics = {
             name: self.to_image(table[name].to_numpy()[self.mask])
-            for name in self.columns - {"x", "y", "z"}
+            for name in self.columns - {"x", "y", "z", "level", "patch"}
         }
 
     def to_image(self, values: np.ndarray) -> np.ndarray:
         img = np.full(self.shape, np.nan)
-        img[self.iy, self.ix] = values
+        vals = np.asarray(values)[self.order]
+        for kk in np.unique(self.k):
+            sel = self.k == kk
+            for dy in range(kk):
+                for dx in range(kk):
+                    img[self.iy0[sel] + dy, self.ix0[sel] + dx] = vals[sel]
         return img
 
 
@@ -149,6 +202,7 @@ def main() -> None:
     ap.add_argument("--cmap", default="magma", help="matplotlib colormap (default: magma)")
     ap.add_argument("--max-dim", type=int, default=1080, help="downsample frames above this size (default: 1080)")
     ap.add_argument("--grains", action="store_true", help="color solid regions by grain orientation (needs a theta0 static field)")
+    ap.add_argument("--patches", action="store_true", help="outline refined AMR patches")
     args = ap.parse_args()
 
     if not args.run_dir.is_dir():
@@ -200,9 +254,28 @@ def main() -> None:
             img0, origin="lower", extent=first.extent, cmap=cmap, vmin=lo, vmax=hi
         )
 
+    outline_state = {"epoch": None, "artists": []}
+
+    def draw_patches(epoch: int) -> None:
+        if not args.patches or outline_state["epoch"] == epoch:
+            return
+        from matplotlib.patches import Rectangle
+
+        for a in outline_state["artists"]:
+            a.remove()
+        outline_state["artists"] = [
+            ax.add_patch(
+                Rectangle((x0, y0), w, h, fill=False, ec="white", lw=0.6, alpha=0.8)
+            )
+            for (_lv, x0, y0, w, h) in grids[epoch].patch_boxes
+        ]
+        outline_state["epoch"] = epoch
+
     def update(i: int):
         step, path = snaps[i]
         img, t = frame_image(path)
+        epoch = int(pq.read_table(path, columns=["epoch"])["epoch"][0].as_py())
+        draw_patches(epoch)
         artist.set_data(img)
         title.set_text(f"{args.field}  step {step}  t = {t:.1f}")
         return artist, title

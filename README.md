@@ -234,6 +234,7 @@ Live progress via `indicatif`:
 | Layer | Shipped today |
 |---|---|
 | **Geometry** | `CartesianGrid<const D>` (uniform, block-tiled, any dimension, per-dimension periodic wrap via `with_periodic`), signed ghost indexing, dimension-sweep halo exchange with mirror (no-flux) physical boundaries on non-periodic faces, `fill_from_fn` declarative initial conditions |
+| **AMR** | Berger–Oliger block-structured refinement behind the same `Grid` trait: `AmrGrid<const D>` patch hierarchies (proper nesting and ratio alignment enforced at construction), Berger–Rigoutsos signature clustering, conservative restriction + bilinear prolongation, and adaptivity as a defaulted `Adapt` policy on `Simulation` (`BergerOliger` + `GradientTagger`; `Static` no-op default). Global dt v1; time subcycling and refluxing are roadmap |
 | **Discretization** | `FiniteDifference` (central, 2nd order), `FiniteVolume` (Karma–Rappel anisotropic flux divergence); operator tags `Laplacian`, `Gradient`, `Divergence`, `AnisotropicDivergence` |
 | **Integrators** | `ForwardEuler`, `EulerMaruyama` (√dt-correct stochastic), `RungeKutta4` (O(dt⁴) drift, composable with noise) |
 | **Models** | `ModelC` — Karma–Rappel dendritic solidification: coupled φ/u, 4-fold anisotropy, multi-grain nucleation with **per-grain crystallographic orientation** (static θ₀(x) field via nearest-seed Voronoi; anisotropy evaluated as A(θ − θ₀)); O(cells + blocks·grains) initialization |
@@ -315,6 +316,9 @@ Every layer is pinned by an *exactness* test, not a tolerance hand-wave:
 | Solidification physics | the shipped phase-field model | φ stays in its wells, seed grows, latent heat bounded by the melting point |
 | Halo exchange / mirror BCs | exact ghost values, every layer, cross-block and boundary | cell-exact assertions |
 | Periodic boundaries | topology-level wrap: exact ghosts (multi-block, self-wrap, corners) + periodic eigenmode decay | cell-exact + 1e-10 relative |
+| AMR patches | stencils on a patch vs. a uniform twin grid; full-fine-tiling run vs. uniform run | bitwise identical |
+| AMR intergrid | linear fields through exchange/prolongation/restriction; migration through copy + prolong paths | exact to 1e-12 |
+| AMR adaptivity | adaptive vs. coarse vs. restricted-fine reference; Model C interface tracked by \|∇φ\| tagging | adaptive strictly beats coarse; interface cells always refined |
 | Static-field layout | tendency buffers skip zero-tendency fields | zero-length slabs; axpy/noise leave statics bit-identical |
 | Parquet round-trip | the on-disk snapshot contract | doubles round-trip bit-for-bit; row order matches the static file |
 | Async pipeline | delivery, ring recycling, drain-on-shutdown | exact snapshot schedule received; `finish()` runs |
@@ -359,7 +363,7 @@ Any method-of-lines system **∂Y/∂t = F(Y, ∇Y, ∇²Y, …, x, t) + Σⱼ V
 | **Incompressible Navier–Stokes, quasi-static elasticity** | the implicit stack above (pressure projection / global solve) | models-as-bounds pattern unchanged |
 | **IMEX splitting** for stiff reactions | optional stiff/non-stiff RHS split on `Model` | default method, existing models unaffected |
 | **Adaptive CFL** (advection-dominated) | `stable_dt` currently cannot see the state; needs the same reductions | optional `stable_dt_state` method |
-| **AMR** | quadtree/octree grids behind the same `Grid` GAT-view contract | designed-for from day one: blocks are the refinement unit; stencils own coarse–fine interfaces |
+| **AMR time subcycling + refluxing** (Berger–Oliger refined timestepping, Berger–Colella conservation fix-up) | per-level dt with time-interpolated coarse boundaries; flux registers at coarse–fine faces | the patch hierarchy, intergrid transfers, and `Adapt` policy already exist; both are new integrator orchestration only |
 
 ### Outside the Current Architecture
 

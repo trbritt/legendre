@@ -29,7 +29,7 @@ use crate::{
     geometry::{
         GridError,
         cartesian::{CartesianGrid, CartesianView, CartesianViewMut},
-        grid::{BlockId, Grid},
+        grid::{BlockId, BoxedBlocks, Grid},
     },
 };
 
@@ -212,6 +212,18 @@ impl<const D: usize> AmrGrid<D> {
         &self.patches[block.index()]
     }
 
+    /// Cell spacing at the finest level the ratio capacity allows.
+    /// Global-dt drivers must be stable here even before that level is
+    /// populated — a regrid may introduce it mid-run.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic: level 0's spacing always exists.
+    #[must_use]
+    pub fn finest_spacing(&self) -> [f64; D] {
+        *self.level_spacing.last().expect("level 0 always exists")
+    }
+
     /// The whole domain as a cell box at level `level`'s resolution.
     #[must_use]
     pub fn level_domain(&self, level: u8) -> CellBox<D> {
@@ -358,6 +370,12 @@ impl<const D: usize> Grid for AmrGrid<D> {
     ) -> CartesianViewMut<'a, T, D> {
         debug_assert_eq!(data.len(), self.block_len(block, ghost));
         CartesianViewMut::from_raw_mut(data, self.patch(block).extent(), ghost)
+    }
+}
+
+impl<const D: usize> BoxedBlocks<D> for AmrGrid<D> {
+    fn block_extent(&self, block: BlockId) -> [usize; D] {
+        self.patch(block).extent()
     }
 }
 

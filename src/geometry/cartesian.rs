@@ -13,7 +13,7 @@
 //! Views do this arithmetic inline; after monomorphization a stencil read
 //! `u.get([1, 0])` is a single indexed load.
 
-use super::grid::{BlockId, Grid};
+use super::grid::{BlockId, BoxedBlocks, Grid};
 use crate::{
     core::{
         state::{FieldHandle, State},
@@ -540,5 +540,11 @@ impl<const D: usize> Grid for CartesianGrid<D> {
             interior: self.block_cells,
             ghost,
         }
+    }
+}
+
+impl<const D: usize> BoxedBlocks<D> for CartesianGrid<D> {
+    fn block_extent(&self, _block: BlockId) -> [usize; D] {
+        self.block_cells
     }
 }
