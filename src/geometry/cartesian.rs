@@ -481,6 +481,10 @@ impl<const D: usize> Grid for CartesianGrid<D> {
         self.spacing
     }
 
+    fn finest_spacing(&self) -> [f64; D] {
+        self.spacing
+    }
+
     #[allow(clippy::needless_range_loop)]
     fn cell_center(&self, block: BlockId, idx: [isize; D]) -> [f64; D] {
         let coords = self.block_coords(block);

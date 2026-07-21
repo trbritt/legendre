@@ -73,8 +73,7 @@ where
         });
     }
 
-    fn stable_dt(&self, grid: &CartesianGrid<D>) -> Option<f64> {
-        let h = grid.spacing(BlockId(0));
+    fn stable_dt(&self, h: [f64; D]) -> Option<f64> {
         let min_h = h.iter().copied().fold(f64::MAX, f64::min);
         Some(0.5 / (2.0 * D as f64) * min_h * min_h / self.kappa)
     }

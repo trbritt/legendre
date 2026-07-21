@@ -19,7 +19,7 @@ use crate::{
 pub struct ForwardEuler;
 
 impl<G: Grid, D: Sync> Integrator<G, D, NoNoise> for ForwardEuler {
-    fn stage_layout(&self) -> StageLayout {
+    fn stage_layout(&self, _grid: &G) -> StageLayout {
         StageLayout {
             stages: vec![StageKind::Tendency(Driver::Time)],
         }

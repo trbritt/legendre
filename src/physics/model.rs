@@ -128,9 +128,16 @@ pub trait Model<G: Grid, D>: Send + Sync {
         scratch: &mut Scratch<Self::Scalar, S>,
     );
 
-    /// Largest stable explicit timestep, if the model knows one (e.g.
-    /// `0.25·h²/D` for phase fields). Advisory; drivers may use it to pick dt.
-    fn stable_dt(&self, _grid: &G) -> Option<f64> {
+    /// Largest stable explicit timestep for a cell of the given `spacing`,
+    /// if the model knows one (e.g. `0.25·h²/D` for a diffusion term).
+    ///
+    /// A *pure function of spacing* — not the whole grid — so an integrator
+    /// can evaluate it at whichever resolution it needs: the finest cell
+    /// for a global-dt scheme, or per level for subcycling, where the ratio
+    /// `stable_dt(h_coarse) / stable_dt(h_fine)` gives the substep count
+    /// directly (parabolic ⇒ `r²`, hyperbolic ⇒ `r`, no assumption baked
+    /// in). Advisory; drivers may use it to pick dt.
+    fn stable_dt(&self, _spacing: G::Point) -> Option<f64> {
         None
     }
 }

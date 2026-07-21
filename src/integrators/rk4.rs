@@ -21,7 +21,7 @@ use crate::{
 pub struct RungeKutta4;
 
 impl<G: Grid, D: Sync> Integrator<G, D, NoNoise> for RungeKutta4 {
-    fn stage_layout(&self) -> StageLayout {
+    fn stage_layout(&self, _grid: &G) -> StageLayout {
         let mut stages = vec![StageKind::Tendency(Driver::Time); 4]; // k1..k4
         stages.push(StageKind::State); // y_tmp
         StageLayout { stages }

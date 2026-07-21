@@ -24,7 +24,7 @@ pub struct EulerMaruyama {
 }
 
 impl<G: Grid, D: Sync, N: DriverSet> Integrator<G, D, N> for EulerMaruyama {
-    fn stage_layout(&self) -> StageLayout {
+    fn stage_layout(&self, _grid: &G) -> StageLayout {
         let mut stages = Vec::with_capacity(1 + N::LEN);
         stages.push(StageKind::Tendency(Driver::Time));
         stages.extend((0..N::LEN).map(|i| StageKind::Tendency(N::driver(i))));

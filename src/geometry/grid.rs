@@ -82,6 +82,13 @@ pub trait Grid: Send + Sync + 'static {
     /// Cell spacing on this block (level-dependent under AMR).
     fn spacing(&self, block: BlockId) -> Self::Point;
 
+    /// The finest cell spacing this grid can ever have — its own spacing
+    /// for a uniform grid, the spacing at the deepest level the refinement
+    /// capacity allows for an AMR grid (even before that level is
+    /// populated). A global-dt integrator picks its timestep from this so
+    /// the run stays stable when a regrid later introduces fine patches.
+    fn finest_spacing(&self) -> Self::Point;
+
     /// Physical coordinates of a cell center.
     fn cell_center(&self, block: BlockId, idx: Self::Index) -> Self::Point;
 

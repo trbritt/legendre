@@ -90,45 +90,59 @@ pub fn restrict<T: Real, S: StorageBackend<T>, const D: usize>(
     state: &mut State<T, S>,
     handle: FieldHandle<T>,
 ) {
+    for fine_level in (1..grid.num_levels() as u8).rev() {
+        restrict_level(grid, state, handle, fine_level);
+    }
+}
+
+/// Restrict a single transition: level `fine_level` onto `fine_level − 1`.
+/// The unit the Berger–Oliger subcycle synchronizes with after each fine
+/// cycle completes.
+pub fn restrict_level<T: Real, S: StorageBackend<T>, const D: usize>(
+    grid: &AmrGrid<D>,
+    state: &mut State<T, S>,
+    handle: FieldHandle<T>,
+    fine_level: u8,
+) {
+    debug_assert!(fine_level >= 1, "restriction needs a coarser level");
     let ghost = state.layout().ghost(handle.index());
-    for level in (1..grid.num_levels() as u8).rev() {
-        let r = i64::from(grid.ratios()[level as usize - 1]);
-        let inv = T::from_f64(1.0 / (r as f64).powi(D as i32));
-        for fb in grid.blocks_at(level) {
-            let fp = *grid.patch(fb);
-            // Ratio alignment makes this coarsening exact.
-            let covered = CellBox {
-                lo: std::array::from_fn(|d| fp.bx.lo[d] / r),
-                hi: std::array::from_fn(|d| fp.bx.hi[d] / r),
-            };
-            for cb in grid.blocks_at(level - 1) {
-                let cp = *grid.patch(cb);
-                let overlap = covered.clipped(&cp.bx);
-                if overlap.cells() == 0 {
-                    continue;
-                }
-                let (dst, src) = state.slab_pair_mut(cb, fb, handle);
-                let mut coarse = grid.view_mut(cb, ghost, dst);
-                let fine = grid.view(fb, ghost, src);
-                for_each_cell(&overlap, |c| {
-                    let mut sum = T::ZERO;
-                    let children = CellBox::<D> {
-                        lo: std::array::from_fn(|d| c[d] * r - fp.bx.lo[d]),
-                        hi: std::array::from_fn(|d| (c[d] + 1) * r - fp.bx.lo[d]),
-                    };
-                    for_each_cell(&children, |k| {
-                        sum += fine.get(std::array::from_fn(|d| k[d] as isize));
-                    });
-                    let local: [isize; D] = std::array::from_fn(|d| (c[d] - cp.bx.lo[d]) as isize);
-                    coarse.set(local, sum * inv);
-                });
+    let r = i64::from(grid.ratios()[fine_level as usize - 1]);
+    let inv = T::from_f64(1.0 / (r as f64).powi(D as i32));
+    for fb in grid.blocks_at(fine_level) {
+        let fp = *grid.patch(fb);
+        // Ratio alignment makes this coarsening exact.
+        let covered = CellBox {
+            lo: std::array::from_fn(|d| fp.bx.lo[d] / r),
+            hi: std::array::from_fn(|d| fp.bx.hi[d] / r),
+        };
+        for cb in grid.blocks_at(fine_level - 1) {
+            let cp = *grid.patch(cb);
+            let overlap = covered.clipped(&cp.bx);
+            if overlap.cells() == 0 {
+                continue;
             }
+            let (dst, src) = state.slab_pair_mut(cb, fb, handle);
+            let mut coarse = grid.view_mut(cb, ghost, dst);
+            let fine = grid.view(fb, ghost, src);
+            for_each_cell(&overlap, |c| {
+                let mut sum = T::ZERO;
+                let children = CellBox::<D> {
+                    lo: std::array::from_fn(|d| c[d] * r - fp.bx.lo[d]),
+                    hi: std::array::from_fn(|d| (c[d] + 1) * r - fp.bx.lo[d]),
+                };
+                for_each_cell(&children, |k| {
+                    sum += fine.get(std::array::from_fn(|d| k[d] as isize));
+                });
+                let local: [isize; D] = std::array::from_fn(|d| (c[d] - cp.bx.lo[d]) as isize);
+                coarse.set(local, sum * inv);
+            });
         }
     }
 }
 
 /// Fill every ghost cell of every patch: same-level exchange, physical
-/// mirror, coarse→fine prolongation (see the module docs).
+/// mirror, coarse→fine prolongation (see the module docs). The global-dt
+/// path, where every level is at the same time.
 pub fn fill_ghosts_mirror<T: Real, S: StorageBackend<T>, const D: usize>(
     grid: &AmrGrid<D>,
     state: &mut State<T, S>,
@@ -138,52 +152,96 @@ pub fn fill_ghosts_mirror<T: Real, S: StorageBackend<T>, const D: usize>(
     if ghost == 0 {
         return;
     }
-    // Gather-then-write with ring-only iteration: ghost cells are a
-    // perimeter, so never scan the grown *box* (an area) to find them,
-    // and batch all writes through one mutable view per patch.
-    let mut gathered: Vec<([isize; D], T)> = Vec::new();
+    let mut scratch: Vec<([isize; D], T)> = Vec::new();
     for level in 0..grid.num_levels() as u8 {
-        debug_assert!(
-            level == 0 || u64::from(ghost) <= u64::from(grid.ratios()[level as usize - 1]),
-            "ghost width may not exceed the refinement ratio (interpolation \
-             stencil would leave the properly-nested coarse margin)"
-        );
-        let domain = grid.level_domain(level);
-        for pb in grid.blocks_at(level) {
-            let p = *grid.patch(pb);
-            gathered.clear();
-            for_each_ring_cell(&p.bx, i64::from(ghost), |cell| {
-                // Physical mirror: reflect out-of-domain coordinates.
-                let target: [i64; D] = std::array::from_fn(|d| {
-                    if cell[d] < domain.lo[d] {
-                        2 * domain.lo[d] - 1 - cell[d]
-                    } else if cell[d] >= domain.hi[d] {
-                        2 * domain.hi[d] - 1 - cell[d]
-                    } else {
-                        cell[d]
-                    }
-                });
-                let value = grid.find_patch(level, target).map_or_else(
-                    || {
-                        debug_assert!(level > 0, "level 0 tiles the domain");
-                        prolonged(grid, state, handle, level, target)
-                    },
-                    |src| {
-                        // Same-level donor (possibly this very patch, for
-                        // mirror ghosts): read its interior.
-                        let sp = grid.patch(src);
-                        let local: [isize; D] =
-                            std::array::from_fn(|d| (target[d] - sp.bx.lo[d]) as isize);
-                        state.view(grid, src, handle).get(local)
-                    },
-                );
-                let local: [isize; D] = std::array::from_fn(|d| (cell[d] - p.bx.lo[d]) as isize);
-                gathered.push((local, value));
+        fill_one_level(grid, state, None, handle, level, ghost, &mut scratch);
+    }
+}
+
+/// Fill one level's ghosts under **subcycling**.
+///
+/// Same-level exchange and physical mirror read the current `state`.
+/// `time_interp = Some((old, alpha))` makes the coarse→fine prolongation
+/// interpolate *in time* between `old` (the coarser level at the start of
+/// its step) and the current `state` (the coarser level after its step),
+/// at fraction `alpha ∈ [0, 1]`. Level 0 never prolongs, so it passes
+/// `None`.
+pub fn fill_level<T: Real, S: StorageBackend<T>, const D: usize>(
+    grid: &AmrGrid<D>,
+    state: &mut State<T, S>,
+    time_interp: Option<(&State<T, S>, f64)>,
+    handle: FieldHandle<T>,
+    level: u8,
+) {
+    let ghost = state.layout().ghost(handle.index());
+    if ghost == 0 {
+        return;
+    }
+    let mut scratch = Vec::new();
+    fill_one_level(grid, state, time_interp, handle, level, ghost, &mut scratch);
+}
+
+/// The shared per-level ghost fill. `time_interp = Some((old, alpha))`
+/// blends the coarse prolongation source in time; `None` prolongs from the
+/// current state alone (global dt). Gather-then-write with ring-only
+/// iteration (ghosts are a perimeter, not an area); `scratch` is reused
+/// across levels.
+fn fill_one_level<T: Real, S: StorageBackend<T>, const D: usize>(
+    grid: &AmrGrid<D>,
+    state: &mut State<T, S>,
+    time_interp: Option<(&State<T, S>, f64)>,
+    handle: FieldHandle<T>,
+    level: u8,
+    ghost: u32,
+    scratch: &mut Vec<([isize; D], T)>,
+) {
+    debug_assert!(
+        level == 0 || u64::from(ghost) <= u64::from(grid.ratios()[level as usize - 1]),
+        "ghost width may not exceed the refinement ratio (interpolation \
+         stencil would leave the properly-nested coarse margin)"
+    );
+    let domain = grid.level_domain(level);
+    for pb in grid.blocks_at(level) {
+        let p = *grid.patch(pb);
+        scratch.clear();
+        for_each_ring_cell(&p.bx, i64::from(ghost), |cell| {
+            // Physical mirror: reflect out-of-domain coordinates.
+            let target: [i64; D] = std::array::from_fn(|d| {
+                if cell[d] < domain.lo[d] {
+                    2 * domain.lo[d] - 1 - cell[d]
+                } else if cell[d] >= domain.hi[d] {
+                    2 * domain.hi[d] - 1 - cell[d]
+                } else {
+                    cell[d]
+                }
             });
-            let mut v = state.view_mut(grid, pb, handle);
-            for &(local, value) in &gathered {
-                v.set(local, value);
-            }
+            let value = grid.find_patch(level, target).map_or_else(
+                || {
+                    debug_assert!(level > 0, "level 0 tiles the domain");
+                    let v_new = prolonged(grid, state, handle, level, target);
+                    match time_interp {
+                        Some((old, alpha)) => {
+                            let v_old = prolonged(grid, old, handle, level, target);
+                            v_old * T::from_f64(1.0 - alpha) + v_new * T::from_f64(alpha)
+                        }
+                        None => v_new,
+                    }
+                },
+                |src| {
+                    // Same-level donor (possibly this very patch, for
+                    // mirror ghosts): read its interior.
+                    let sp = grid.patch(src);
+                    let local: [isize; D] =
+                        std::array::from_fn(|d| (target[d] - sp.bx.lo[d]) as isize);
+                    state.view(grid, src, handle).get(local)
+                },
+            );
+            let local: [isize; D] = std::array::from_fn(|d| (cell[d] - p.bx.lo[d]) as isize);
+            scratch.push((local, value));
+        });
+        let mut v = state.view_mut(grid, pb, handle);
+        for &(local, value) in scratch.iter() {
+            v.set(local, value);
         }
     }
 }

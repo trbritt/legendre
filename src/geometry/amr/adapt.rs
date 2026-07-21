@@ -266,10 +266,7 @@ fn push_cells<const D: usize>(bx: &CellBox<D>, out: &mut Vec<[i64; D]>) {
 /// Berger–Oliger: "once we have good clusters they do not change very
 /// fast" — threshold flicker must not force a rebuild (with its
 /// migration, reallocation, and stochastic re-keying) every cadence.
-fn hierarchy_acceptable<const D: usize>(
-    grid: &AmrGrid<D>,
-    new_levels: &[Vec<CellBox<D>>],
-) -> bool {
+fn hierarchy_acceptable<const D: usize>(grid: &AmrGrid<D>, new_levels: &[Vec<CellBox<D>>]) -> bool {
     if new_levels.len() != grid.num_levels() - 1 {
         return false;
     }
@@ -318,7 +315,6 @@ fn box_covered<const D: usize>(need: &CellBox<D>, cover: &[CellBox<D>]) -> bool 
         }
     }
 }
-
 
 /// Copy the old solution onto the new hierarchy: level 0 verbatim (the
 /// base tiling never changes), refined cells from the same-level old

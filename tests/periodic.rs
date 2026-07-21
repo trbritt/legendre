@@ -212,8 +212,7 @@ mod physics {
             });
         }
 
-        fn stable_dt(&self, grid: &CartesianGrid<2>) -> Option<f64> {
-            let h = grid.spacing(BlockId(0));
+        fn stable_dt(&self, h: [f64; 2]) -> Option<f64> {
             Some(0.25 * h[0].min(h[1]).powi(2) / self.kappa)
         }
     }

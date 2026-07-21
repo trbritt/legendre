@@ -190,7 +190,7 @@ where
         alloc: &A,
     ) -> Vec<State<M::Scalar, A::Storage>> {
         integrator
-            .stage_layout()
+            .stage_layout(grid)
             .stages
             .iter()
             .map(|kind| match *kind {
@@ -285,8 +285,11 @@ where
         }
     }
 
-    /// Advisory stable dt from the model, if it declares one.
+    /// Advisory timestep for this simulation's integrator on its grid,
+    /// derived from the model's stability law — the finest-cell dt for a
+    /// global-dt scheme, the coarsest-level dt for a subcycling one (see
+    /// [`Integrator::suggested_dt`]).
     pub fn stable_dt(&self) -> Option<f64> {
-        self.model.stable_dt(&self.grid)
+        self.integrator.suggested_dt(&self.model, &self.grid)
     }
 }

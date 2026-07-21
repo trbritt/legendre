@@ -335,6 +335,10 @@ mod intergrid {
                 output.set(idx, output.get(idx) * self.kappa);
             });
         }
+
+        fn stable_dt(&self, h: [f64; 2]) -> Option<f64> {
+            Some(0.25 * h[0].min(h[1]).powi(2) / self.kappa)
+        }
     }
 
     /// Fine patches tiling the whole domain: the fine level *is* a
@@ -979,6 +983,246 @@ mod model_c_adaptive {
                         );
                     }
                 }
+            });
+        }
+    }
+}
+
+/// Subcycling: coarse levels take large steps, fine levels subcycle.
+mod subcycling {
+    use super::intergrid::{Heat, UniformHeat};
+    use super::*;
+    use legendre::{
+        core::scheduler::{RayonScheduler, Scheduler},
+        geometry::{
+            amr::{BergerOliger, ClusterParams, GradientTagger, RegridPolicy},
+            cartesian::{fill_from_fn, for_each_interior},
+        },
+        integrators::Subcycling,
+    };
+
+    const KAPPA: f64 = 0.7;
+
+    fn init([x, y]: [f64; 2]) -> f64 {
+        (0.6 * x).cos() + (1.1 * y).sin()
+    }
+
+    /// Fully fine-tiled subcycled run: the fine level's ghosts are all
+    /// same-level exchange or physical mirror (never prolongation), so
+    /// subcycling steps it independently `n` times per coarse step — it
+    /// must match a uniform-fine grid stepped at the substep dt, bit for
+    /// bit.
+    #[test]
+    fn fully_tiled_subcycled_fine_matches_uniform_fine_bitwise() {
+        const COARSE_STEPS: usize = 25;
+        // AMR: 8² base at h = 0.5, fully tiled by two level-1 patches
+        // (h = 0.25, ratio 2 ⇒ 4 substeps for the parabolic heat model).
+        let base = CartesianGrid::new([8, 8], [8, 8], [0.0, 0.0], [0.5, 0.5]).unwrap();
+        let grid = AmrGrid::from_patches(
+            base,
+            &[2],
+            &[vec![
+                CellBox {
+                    lo: [0, 0],
+                    hi: [8, 16],
+                },
+                CellBox {
+                    lo: [8, 0],
+                    hi: [16, 16],
+                },
+            ]],
+        )
+        .unwrap();
+        let mut sim = Simulation::new(
+            grid,
+            FiniteDifference,
+            Heat {
+                kappa: KAPPA,
+                u: None,
+            },
+            Subcycling { seed: 0 },
+            SerialScheduler,
+            SystemAllocator,
+        );
+        let u = sim.model().u.unwrap();
+        let dt_coarse = sim.stable_dt().unwrap(); // level-0 (coarse) dt
+        {
+            let (grid, state) = sim.state_mut();
+            for b in 0..grid.num_blocks() {
+                let block = BlockId(b as u32);
+                let ext = grid.patch(block).extent();
+                let mut v = state.view_mut(grid, block, u);
+                for_each_interior(ext, |idx| v.set(idx, init(grid.cell_center(block, idx))));
+            }
+        }
+        for _ in 0..COARSE_STEPS {
+            sim.step(dt_coarse);
+        }
+        let mut amr_field = vec![[0.0f64; 16]; 16];
+        for fb in sim.grid().blocks_at(1) {
+            let p = *sim.grid().patch(fb);
+            let v = sim.state().view(sim.grid(), fb, u);
+            for_each_interior(p.extent(), |idx| {
+                let gx = (p.bx.lo[0] + idx[0] as i64) as usize;
+                let gy = (p.bx.lo[1] + idx[1] as i64) as usize;
+                amr_field[gy][gx] = v.get(idx);
+            });
+        }
+
+        // Uniform 16² at h = 0.25, stepped at *exactly* dt_coarse / 4 (the
+        // same expression the recursion uses) for 4× as many steps.
+        let hf = 0.25;
+        let dt_fine = dt_coarse / 4.0;
+        let uni = CartesianGrid::new([16, 16], [8, 16], [0.0, 0.0], [hf, hf]).unwrap();
+        let mut usim = Simulation::new(
+            uni,
+            FiniteDifference,
+            UniformHeat {
+                kappa: KAPPA,
+                u: None,
+            },
+            ForwardEuler,
+            SerialScheduler,
+            SystemAllocator,
+        );
+        let uu = usim.model().u.unwrap();
+        {
+            let (grid, state) = usim.state_mut();
+            fill_from_fn(grid, state, uu, init);
+        }
+        for _ in 0..COARSE_STEPS * 4 {
+            usim.step(dt_fine);
+        }
+        for b in 0..usim.grid().num_blocks() {
+            let block = BlockId(b as u32);
+            let v = usim.state().view(usim.grid(), block, uu);
+            for_each_interior(usim.grid().block_cells(), |idx| {
+                let [x, y] = usim.grid().cell_center(block, idx);
+                let gx = (x / hf - 0.5).round() as usize;
+                let gy = (y / hf - 0.5).round() as usize;
+                assert_eq!(
+                    amr_field[gy][gx],
+                    v.get(idx),
+                    "subcycled fine cell ({gx},{gy}) diverged from the uniform-fine run"
+                );
+            });
+        }
+    }
+
+    /// A genuinely refined, adaptive, subcycled run (prolongation + time
+    /// interpolation exercised) must be bit-identical under serial and
+    /// parallel scheduling.
+    #[test]
+    fn adaptive_subcycled_run_is_scheduler_independent() {
+        fn run<Sch: Scheduler>(scheduler: Sch) -> Vec<f64> {
+            let base = CartesianGrid::new([32, 32], [16, 16], [0.0, 0.0], [0.5, 0.5]).unwrap();
+            let grid = AmrGrid::from_patches(base, &[2], &[]).unwrap();
+            let mut sim = Simulation::adaptive(
+                grid,
+                FiniteDifference,
+                Heat {
+                    kappa: KAPPA,
+                    u: None,
+                },
+                Subcycling { seed: 0 },
+                scheduler,
+                SystemAllocator,
+                BergerOliger::new(
+                    GradientTagger {
+                        field: "u",
+                        threshold: 0.03,
+                    },
+                    RegridPolicy {
+                        every: 2,
+                        buffer: 2,
+                        cluster: ClusterParams {
+                            efficiency: 0.7,
+                            min_width: 4,
+                        },
+                    },
+                ),
+            );
+            let u = sim.model().u.unwrap();
+            let dt = sim.stable_dt().unwrap();
+            {
+                let (grid, state) = sim.state_mut();
+                for b in 0..grid.num_blocks() {
+                    let block = BlockId(b as u32);
+                    let ext = grid.patch(block).extent();
+                    let mut v = state.view_mut(grid, block, u);
+                    for_each_interior(ext, |idx| {
+                        let [x, y] = grid.cell_center(block, idx);
+                        let (dx, dy) = (x - 8.0, y - 8.0);
+                        v.set(idx, (-dx.mul_add(dx, dy * dy) / 3.0).exp());
+                    });
+                }
+            }
+            for _ in 0..30 {
+                sim.step(dt);
+            }
+            // The coarse (level-0) solution, restricted-consistent.
+            let mut out = Vec::new();
+            for b in sim.grid().blocks_at(0) {
+                let v = sim.state().view(sim.grid(), b, u);
+                let ext = sim.grid().patch(b).extent();
+                for_each_interior(ext, |idx| out.push(v.get(idx)));
+            }
+            out
+        }
+        assert_eq!(
+            run(SerialScheduler),
+            run(RayonScheduler),
+            "subcycled run must not depend on scheduling"
+        );
+    }
+
+    /// Model C dendrite, adaptive + subcycled, stays physical — the fine
+    /// interface takes r² = 4 substeps per coarse step.
+    #[test]
+    fn model_c_subcycled_dendrite_is_physical() {
+        use legendre::{discretization::finite_volume::FiniteVolume, physics::phasefield::ModelC};
+        let base = CartesianGrid::new([48, 48], [24, 24], [0.0, 0.0], [0.4, 0.4]).unwrap();
+        let grid = AmrGrid::from_patches(base, &[2], &[]).unwrap();
+        let mut sim = Simulation::adaptive(
+            grid,
+            FiniteVolume::default(),
+            ModelC::<NoNoise>::classic(),
+            Subcycling { seed: 0 },
+            SerialScheduler,
+            SystemAllocator,
+            BergerOliger::new(
+                GradientTagger {
+                    field: "phi",
+                    threshold: 0.15,
+                },
+                RegridPolicy {
+                    every: 4,
+                    buffer: 2,
+                    cluster: ClusterParams {
+                        efficiency: 0.8,
+                        min_width: 4,
+                    },
+                },
+            ),
+        );
+        let dt = sim.stable_dt().unwrap();
+        let phi_h = sim.model().phi();
+        {
+            let model = sim.model().clone();
+            let (grid, state) = sim.state_mut();
+            model.initialize(grid.base(), state, [0.4, 0.4], 4.0, 0.7);
+        }
+        for _ in 0..40 {
+            sim.step(dt);
+        }
+        assert_eq!(sim.grid().num_levels(), 2, "interface must be refined");
+        for b in 0..sim.grid().num_blocks() {
+            let block = BlockId(b as u32);
+            let ext = sim.grid().patch(block).extent();
+            let v = sim.state().view(sim.grid(), block, phi_h);
+            for_each_interior(ext, |idx| {
+                let p = v.get(idx);
+                assert!(p.is_finite() && p.abs() < 1.2, "unphysical phi {p}");
             });
         }
     }

@@ -33,7 +33,7 @@ use legendre::{
         cartesian::CartesianGrid,
         grid::Grid,
     },
-    integrators::{EulerMaruyama, Integrator, RungeKutta4},
+    integrators::{EulerMaruyama, Integrator, RungeKutta4, Subcycling},
     io::{
         parquet::ParquetObserver,
         progress::{FieldStat, FieldStatsSink, ProgressObserver, progress_bar},
@@ -111,6 +111,12 @@ struct Args {
     /// level/patch columns; render with `--patches` to outline them.
     #[arg(long)]
     amr: bool,
+
+    /// With --amr, subcycle in time (Berger-Oliger): the coarse level
+    /// takes big steps, the fine level r²=4 substeps, so the finest dt is
+    /// not imposed on the whole domain. Euler-Maruyama only (not rk4).
+    #[arg(long)]
+    subcycle: bool,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -120,6 +126,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Err("--amr with --orient is not supported yet (static-field \
                         migration across regrids blurs theta0)"
                 .into());
+        }
+        if args.subcycle {
+            // Subcycling is single-stage (Euler-Maruyama family) only.
+            if matches!(args.integrator, Scheme::Rk4) {
+                return Err("--subcycle does not support rk4 (multi-stage)".into());
+            }
+            return if args.noise == 0.0 {
+                run_amr::<NoNoise, _>(Subcycling { seed: args.seed }, &args)
+            } else {
+                run_amr::<Wiener<1>, _>(Subcycling { seed: args.seed }, &args)
+            };
         }
         return match args.integrator {
             Scheme::Rk4 => {

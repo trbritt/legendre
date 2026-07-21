@@ -443,8 +443,8 @@ model_c_impl!(
     /// (undamped); latent-heat release at the interface forces that mode
     /// coherently, so it grows secularly and eventually blows up. r = 0.2
     /// damps it (factor −0.6) with 20% margin.
-    fn stable_dt(&self, grid: &CartesianGrid<2>) -> Option<f64> {
-        let [hx, hy] = grid.spacing(BlockId(0));
+    fn stable_dt(&self, spacing: [f64; 2]) -> Option<f64> {
+        let [hx, hy] = spacing;
         Some(0.2 * hx.min(hy).powi(2) / self.d_thermal)
     }
 );
@@ -465,11 +465,11 @@ model_c_impl!(
         amr::fill_ghosts_mirror(grid, state, self.phi());
         amr::fill_ghosts_mirror(grid, state, self.u());
     },
-    /// The Cartesian stability bound evaluated at the finest spacing the
-    /// hierarchy's ratio capacity allows: a global-dt adaptive run must
-    /// remain stable when a regrid populates its finest level mid-run.
-    fn stable_dt(&self, grid: &AmrGrid<2>) -> Option<f64> {
-        let [hx, hy] = grid.finest_spacing();
+    /// The Cartesian stability bound at the given cell spacing. The
+    /// integrator evaluates it at whichever resolution it needs (finest for
+    /// global dt, per level for subcycling).
+    fn stable_dt(&self, spacing: [f64; 2]) -> Option<f64> {
+        let [hx, hy] = spacing;
         Some(0.2 * hx.min(hy).powi(2) / self.d_thermal)
     }
 );

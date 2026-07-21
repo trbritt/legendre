@@ -657,6 +657,60 @@ impl<T: Real, S: StorageBackend<T>> State<T, S> {
         );
     }
 
+    /// [`State::apply_step_with`] restricted to blocks at refinement
+    /// `level` — the Berger–Oliger per-level state update. Blocks at other
+    /// levels are left untouched; noise keys still use absolute block ids,
+    /// so a fine level's increments never collide with a coarse level's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_step_level<G: Grid, N: DriverSet, Sch: Scheduler>(
+        &mut self,
+        scheduler: &Sch,
+        grid: &G,
+        drift: &Self,
+        stochastic: &[Self],
+        dt: f64,
+        seed: u64,
+        salt: u64,
+        level: u8,
+    ) {
+        debug_assert!(Arc::ptr_eq(&self.layout, &drift.layout));
+        debug_assert_eq!(stochastic.len(), N::LEN);
+        let layout = &self.layout;
+        scheduler.for_each_block_mut(
+            &mut self.blocks,
+            || (),
+            |id, mine, ()| {
+                if grid.level(id) != level {
+                    return;
+                }
+                block_apply_driver(
+                    grid,
+                    layout,
+                    mine,
+                    &drift.blocks[id.index()],
+                    id,
+                    Driver::Time,
+                    dt,
+                    seed,
+                    salt,
+                );
+                for (i, amp) in stochastic.iter().enumerate() {
+                    block_apply_driver(
+                        grid,
+                        layout,
+                        mine,
+                        &amp.blocks[id.index()],
+                        id,
+                        N::driver(i),
+                        dt,
+                        seed,
+                        salt,
+                    );
+                }
+            },
+        );
+    }
+
     /// Scheduler-driven [`State::apply_driver`]; identical results under
     /// any scheduling because keys depend only on (driver, block, cell).
     #[allow(clippy::too_many_arguments)]

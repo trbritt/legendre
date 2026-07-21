@@ -219,6 +219,14 @@ impl<const D: usize> AmrGrid<D> {
         self.ratios.len() + 1
     }
 
+    /// Cell spacing at refinement `level` (valid up to `max_levels`, even
+    /// for levels not currently populated — a subcycling scheme reads the
+    /// stability law at each level's resolution).
+    #[must_use]
+    pub fn spacing_at_level(&self, level: u8) -> [f64; D] {
+        self.level_spacing[level as usize]
+    }
+
     /// All patches, level-major (`BlockId` indexes this slice).
     #[must_use]
     pub fn patches(&self) -> &[AmrPatch<D>] {
@@ -229,18 +237,6 @@ impl<const D: usize> AmrGrid<D> {
     #[must_use]
     pub fn patch(&self, block: BlockId) -> &AmrPatch<D> {
         &self.patches[block.index()]
-    }
-
-    /// Cell spacing at the finest level the ratio capacity allows.
-    /// Global-dt drivers must be stable here even before that level is
-    /// populated — a regrid may introduce it mid-run.
-    ///
-    /// # Panics
-    ///
-    /// Does not panic: level 0's spacing always exists.
-    #[must_use]
-    pub fn finest_spacing(&self) -> [f64; D] {
-        *self.level_spacing.last().expect("level 0 always exists")
     }
 
     /// The whole domain as a cell box at level `level`'s resolution.
@@ -382,6 +378,11 @@ impl<const D: usize> Grid for AmrGrid<D> {
 
     fn spacing(&self, block: BlockId) -> [f64; D] {
         self.level_spacing[self.patch(block).level as usize]
+    }
+
+    fn finest_spacing(&self) -> [f64; D] {
+        // The deepest level the ratio capacity allows, even if unpopulated.
+        *self.level_spacing.last().expect("level 0 always exists")
     }
 
     fn cell_center(&self, block: BlockId, idx: [isize; D]) -> [f64; D] {

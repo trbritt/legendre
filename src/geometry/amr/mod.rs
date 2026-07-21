@@ -22,4 +22,4 @@ mod intergrid;
 pub use adapt::{BergerOliger, GradientTagger, RegridPolicy, TagCells};
 pub use cluster::{CellBox, ClusterParams, cluster};
 pub use grid::{AmrGrid, AmrPatch};
-pub use intergrid::{fill_ghosts_mirror, restrict};
+pub use intergrid::{fill_ghosts_mirror, fill_level, restrict, restrict_level};
