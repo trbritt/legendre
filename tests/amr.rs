@@ -710,7 +710,7 @@ mod adaptive {
             for_each_interior(fsim.grid().block_cells(), |idx| {
                 let [x, y] = fsim.grid().cell_center(block, idx);
                 let (cx, cy) = ((x / 0.5) as usize, (y / 0.5) as usize);
-                reference[cy][cx] += v.get(idx) * 0.25;
+                reference[cy][cx] = v.get(idx).mul_add(0.25, reference[cy][cx]);
             });
         }
 

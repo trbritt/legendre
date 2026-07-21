@@ -100,9 +100,45 @@ impl<D2: Sync, N: DriverSet, const D: usize> Integrator<AmrGrid<D>, D2, N> for S
             .map(|(i, _)| State::<M::Scalar, S>::handle_at(i))
             .collect();
 
+        // One ghost-fill plan per distinct ghost width, built once for this
+        // coarse step and reused across every substep's fill — the
+        // per-cell find_patch/interpolation work happens once, not per
+        // fill. Paired with each field's plan index.
+        let mut widths: Vec<u32> = fields
+            .iter()
+            .map(|h| state.layout().ghost(h.index()))
+            .collect();
+        widths.sort_unstable();
+        widths.dedup();
+        let plans: Vec<amr::FillPlan<D>> = widths
+            .iter()
+            .map(|&w| amr::build_fill_plan(grid, w))
+            .collect();
+        let field_plan: Vec<(FieldHandle<M::Scalar>, usize)> = fields
+            .iter()
+            .map(|&h| {
+                let w = state.layout().ghost(h.index());
+                (h, widths.iter().position(|&x| x == w).unwrap())
+            })
+            .collect();
+
         advance(
-            self.seed, model, grid, disc, scheduler, pool, state, drift, amps, snapshots, &fields,
-            0, t, dt, 0.0,
+            self.seed,
+            model,
+            grid,
+            disc,
+            scheduler,
+            pool,
+            state,
+            drift,
+            amps,
+            snapshots,
+            &field_plan,
+            &plans,
+            0,
+            t,
+            dt,
+            0.0,
         );
     }
 }
@@ -123,7 +159,8 @@ fn advance<M, S, Sch, D2, const D: usize, N>(
     drift: &mut State<M::Scalar, S>,
     amps: &mut [State<M::Scalar, S>],
     snapshots: &mut [State<M::Scalar, S>],
-    fields: &[FieldHandle<M::Scalar>],
+    field_plan: &[(FieldHandle<M::Scalar>, usize)],
+    plans: &[amr::FillPlan<D>],
     level: u8,
     t: f64,
     dt: f64,
@@ -144,9 +181,9 @@ fn advance<M, S, Sch, D2, const D: usize, N>(
     // 2. Fill this level's ghosts. Level 0 has no coarser parent; finer
     //    levels interpolate their prolongation source between the parent
     //    snapshot (at α) and the parent's post-step state.
-    for &h in fields {
+    for &(h, pi) in field_plan {
         let interp = (level > 0).then(|| (&snapshots[l - 1] as &State<M::Scalar, S>, alpha));
-        amr::fill_level(grid, state, interp, h, level);
+        amr::fill_level(grid, state, interp, h, level, &plans[pi]);
     }
 
     // 3. Step this level by dt (Euler–Maruyama, restricted to its blocks).
@@ -197,7 +234,8 @@ fn advance<M, S, Sch, D2, const D: usize, N>(
                 drift,
                 amps,
                 snapshots,
-                fields,
+                field_plan,
+                plans,
                 child,
                 child_t,
                 dt_child,
@@ -205,7 +243,7 @@ fn advance<M, S, Sch, D2, const D: usize, N>(
             );
         }
         // 5. Fine solution wins beneath the patch.
-        for &h in fields {
+        for &(h, _) in field_plan {
             amr::restrict_level(grid, state, h, child);
         }
     }

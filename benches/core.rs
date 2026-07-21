@@ -43,7 +43,7 @@ use legendre::{
         cartesian::{CartesianGrid, fill_ghosts_mirror},
         grid::{BlockId, Grid},
     },
-    integrators::{EulerMaruyama, Integrator, RungeKutta4},
+    integrators::{EulerMaruyama, Integrator, RungeKutta4, Subcycling},
     physics::{
         model::{NoNoise, Wiener},
         phasefield::ModelC,
@@ -215,6 +215,40 @@ fn amr(c: &mut Criterion) {
             FiniteVolume::default(),
             ModelC::<NoNoise>::classic(),
             EulerMaruyama { seed: 7 },
+            SerialScheduler,
+            SystemAllocator,
+            BergerOliger::new(
+                GradientTagger {
+                    field: "phi",
+                    threshold: 0.15,
+                },
+                RegridPolicy {
+                    every: 4,
+                    buffer: 2,
+                    cluster: ClusterParams {
+                        efficiency: 0.8,
+                        min_width: 4,
+                    },
+                },
+            ),
+        );
+        let dt = sim.stable_dt().unwrap();
+        {
+            let model = sim.model().clone();
+            let (grid, state) = sim.state_mut();
+            model.initialize(grid.base(), state, [H, H], 10.0 * H, 0.7);
+        }
+        b.iter(|| sim.step(dt));
+    });
+
+    c.bench_function("amr/step/model_c_subcycled", |b| {
+        let base = CartesianGrid::new([N; 2], [N / 2; 2], [0.0; 2], [H; 2]).unwrap();
+        let grid = AmrGrid::from_patches(base, &[2], &[]).unwrap();
+        let mut sim = Simulation::adaptive(
+            grid,
+            FiniteVolume::default(),
+            ModelC::<NoNoise>::classic(),
+            Subcycling { seed: 7 },
             SerialScheduler,
             SystemAllocator,
             BergerOliger::new(
