@@ -13,7 +13,7 @@
 **A block-structured, deterministic, scheduler-driven PDE simulation framework in Rust.**
 
 <sub>The image is real output, not artwork: a Karma–Rappel Model C solidification
-front from <code>examples/model_c</code>, rendered with
+front from <code>examples/model_c</code> and AMR subcycling, rendered with
 <code>scripts/render_model_c.py</code>.</sub>
 
 </div>
@@ -234,9 +234,9 @@ Live progress via `indicatif`:
 | Layer | Shipped today |
 |---|---|
 | **Geometry** | `CartesianGrid<const D>` (uniform, block-tiled, any dimension, per-dimension periodic wrap via `with_periodic`), signed ghost indexing, dimension-sweep halo exchange with mirror (no-flux) physical boundaries on non-periodic faces, `fill_from_fn` declarative initial conditions |
-| **AMR** | Berger–Oliger block-structured refinement behind the same `Grid` trait: `AmrGrid<const D>` patch hierarchies (proper nesting and ratio alignment enforced at construction), Berger–Rigoutsos signature clustering, conservative restriction + bilinear prolongation, and adaptivity as a defaulted `Adapt` policy on `Simulation` (`BergerOliger` + `GradientTagger`; `Static` no-op default). Global dt v1; time subcycling and refluxing are roadmap |
+| **AMR** | Berger–Oliger block-structured refinement behind the same `Grid` trait: `AmrGrid<const D>` patch hierarchies (proper nesting and ratio alignment enforced at construction), Berger–Rigoutsos signature clustering, conservative restriction + bilinear prolongation, and adaptivity as a defaulted `Adapt` policy on `Simulation` (`BergerOliger` + `GradientTagger`; `Static` no-op default). Runs global-dt (any integrator) or **time-subcycled** (`Subcycling`: coarse levels take big steps, finer levels `r²`/`r` substeps derived from the model's stability law, with time-interpolated coarse boundaries) |
 | **Discretization** | `FiniteDifference` (central, 2nd order), `FiniteVolume` (Karma–Rappel anisotropic flux divergence); operator tags `Laplacian`, `Gradient`, `Divergence`, `AnisotropicDivergence` |
-| **Integrators** | `ForwardEuler`, `EulerMaruyama` (√dt-correct stochastic), `RungeKutta4` (O(dt⁴) drift, composable with noise) |
+| **Integrators** | `ForwardEuler`, `EulerMaruyama` (√dt-correct stochastic), `RungeKutta4` (O(dt⁴) drift, composable with noise), `Subcycling` (Berger–Oliger refined timestepping on `AmrGrid`) |
 | **Models** | `ModelC` — Karma–Rappel dendritic solidification: coupled φ/u, 4-fold anisotropy, multi-grain nucleation with **per-grain crystallographic orientation** (static θ₀(x) field via nearest-seed Voronoi; anisotropy evaluated as A(θ − θ₀)); O(cells + blocks·grains) initialization |
 | **Execution** | `SerialScheduler` (oracle), `RayonScheduler` (work-stealing), worker-pinned `ScratchPool`, scheduler-parallel state algebra |
 | **Observation** | `AsyncObserver` pipeline, `ParquetObserver<D>` (long-format, snappy, x/y/z columns), `FieldStatsSink` + `indicatif` progress, movie rendering script (`scripts/render_model_c.py`) |
@@ -319,6 +319,7 @@ Every layer is pinned by an *exactness* test, not a tolerance hand-wave:
 | AMR patches | stencils on a patch vs. a uniform twin grid; full-fine-tiling run vs. uniform run | bitwise identical |
 | AMR intergrid | linear fields through exchange/prolongation/restriction; migration through copy + prolong paths | exact to 1e-12 |
 | AMR adaptivity | adaptive vs. coarse vs. restricted-fine reference; Model C interface tracked by \|∇φ\| tagging | adaptive strictly beats coarse; interface cells always refined |
+| AMR subcycling | fully-tiled subcycled run vs. uniform-fine twin; adaptive run vs. scheduler swap (serial vs. Rayon) | bitwise identical; scheduler-independent |
 | Static-field layout | tendency buffers skip zero-tendency fields | zero-length slabs; axpy/noise leave statics bit-identical |
 | Parquet round-trip | the on-disk snapshot contract | doubles round-trip bit-for-bit; row order matches the static file |
 | Async pipeline | delivery, ring recycling, drain-on-shutdown | exact snapshot schedule received; `finish()` runs |
@@ -363,7 +364,7 @@ Any method-of-lines system **∂Y/∂t = F(Y, ∇Y, ∇²Y, …, x, t) + Σⱼ V
 | **Incompressible Navier–Stokes, quasi-static elasticity** | the implicit stack above (pressure projection / global solve) | models-as-bounds pattern unchanged |
 | **IMEX splitting** for stiff reactions | optional stiff/non-stiff RHS split on `Model` | default method, existing models unaffected |
 | **Adaptive CFL** (advection-dominated) | `stable_dt` currently cannot see the state; needs the same reductions | optional `stable_dt_state` method |
-| **AMR time subcycling + refluxing** (Berger–Oliger refined timestepping, Berger–Colella conservation fix-up) | per-level dt with time-interpolated coarse boundaries; flux registers at coarse–fine faces | the patch hierarchy, intergrid transfers, and `Adapt` policy already exist; both are new integrator orchestration only |
+| **AMR refluxing** (Berger–Colella conservation fix-up) | flux registers at coarse–fine faces correct the coarse solution for the fine fluxes that crossed them | subcycled refined timestepping already ships (`Subcycling`); refluxing is a flux-register layer on the existing intergrid transfers |
 
 ### Outside the Current Architecture
 
