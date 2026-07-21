@@ -21,8 +21,10 @@
 //! ```
 //!
 //! `Subcycling::step(dt)` advances the whole hierarchy by one **level-0**
-//! step `dt`; drivers size it with
-//! [`AmrGrid::max_time_refinement`](crate::geometry::amr::AmrGrid::max_time_refinement).
+//! step `dt`; `Simulation::stable_dt()` returns the right coarse dt for it
+//! (via [`Integrator::suggested_dt`](crate::integrators::Integrator::suggested_dt),
+//! the coarsest level's stable dt), and the per-level substep counts are
+//! derived from the model's stability law at each level's spacing.
 //!
 //! **v1 scope.** The scheme is fixed to Euler–Maruyama (forward Euler for
 //! `NoNoise`); regridding happens only at level-0 (synchronized)
