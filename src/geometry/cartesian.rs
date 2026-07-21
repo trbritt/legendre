@@ -13,7 +13,7 @@
 //! Views do this arithmetic inline; after monomorphization a stencil read
 //! `u.get([1, 0])` is a single indexed load.
 
-use super::grid::{BlockId, Grid};
+use super::grid::{BlockId, BoxedBlocks, Grid};
 use crate::{
     core::{
         state::{FieldHandle, State},
@@ -121,6 +121,12 @@ impl<const D: usize> CartesianGrid<D> {
         self.cells
     }
 
+    /// Physical coordinate of the domain's lower corner.
+    #[must_use]
+    pub const fn origin(&self) -> [f64; D] {
+        self.origin
+    }
+
     /// Interior cells per dimension of one block.
     #[must_use]
     pub const fn block_cells(&self) -> [usize; D] {
@@ -206,6 +212,19 @@ pub struct CartesianView<'a, T: Scalar, const D: usize> {
     ghost: u32,
 }
 
+impl<'a, T: Scalar, const D: usize> CartesianView<'a, T, D> {
+    /// Wrap a ghost-inclusive slab of a uniform box (used by every grid
+    /// family whose blocks are uniform boxes — Cartesian and AMR patches).
+    #[inline(always)]
+    pub(crate) const fn from_raw(data: &'a [T], interior: [usize; D], ghost: u32) -> Self {
+        Self {
+            data,
+            interior,
+            ghost,
+        }
+    }
+}
+
 impl<T: Scalar, const D: usize> CartesianView<'_, T, D> {
     /// Value at `idx` (ghost cells addressable with negative indices).
     #[inline(always)]
@@ -233,6 +252,18 @@ pub struct CartesianViewMut<'a, T: Scalar, const D: usize> {
     data: &'a mut [T],
     interior: [usize; D],
     ghost: u32,
+}
+
+impl<'a, T: Scalar, const D: usize> CartesianViewMut<'a, T, D> {
+    /// Mutable counterpart of [`CartesianView::from_raw`].
+    #[inline(always)]
+    pub(crate) const fn from_raw_mut(data: &'a mut [T], interior: [usize; D], ghost: u32) -> Self {
+        Self {
+            data,
+            interior,
+            ghost,
+        }
+    }
 }
 
 impl<T: Scalar, const D: usize> CartesianViewMut<'_, T, D> {
@@ -450,6 +481,10 @@ impl<const D: usize> Grid for CartesianGrid<D> {
         self.spacing
     }
 
+    fn finest_spacing(&self) -> [f64; D] {
+        self.spacing
+    }
+
     #[allow(clippy::needless_range_loop)]
     fn cell_center(&self, block: BlockId, idx: [isize; D]) -> [f64; D] {
         let coords = self.block_coords(block);
@@ -509,5 +544,11 @@ impl<const D: usize> Grid for CartesianGrid<D> {
             interior: self.block_cells,
             ghost,
         }
+    }
+}
+
+impl<const D: usize> BoxedBlocks<D> for CartesianGrid<D> {
+    fn block_extent(&self, _block: BlockId) -> [usize; D] {
+        self.block_cells
     }
 }

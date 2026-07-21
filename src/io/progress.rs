@@ -63,8 +63,11 @@ impl ProgressObserver {
     }
 }
 
-impl<T: crate::core::storage::Scalar, S: StorageBackend<T>> Observer<T, S> for ProgressObserver {
-    fn observe(&mut self, step: u64, _t: f64, _state: &State<T, S>) {
+/// Grid-agnostic: progress only needs the step index.
+impl<G, T: crate::core::storage::Scalar, S: StorageBackend<T>> Observer<G, T, S>
+    for ProgressObserver
+{
+    fn observe(&mut self, step: u64, _t: f64, _epoch: u64, _grid: &G, _state: &State<T, S>) {
         self.bar.set_position(step);
     }
 }

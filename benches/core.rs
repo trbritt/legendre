@@ -39,10 +39,11 @@ use legendre::{
     },
     discretization::finite_volume::FiniteVolume,
     geometry::{
+        amr::{AmrGrid, BergerOliger, ClusterParams, GradientTagger, RegridPolicy, cluster},
         cartesian::{CartesianGrid, fill_ghosts_mirror},
         grid::{BlockId, Grid},
     },
-    integrators::{EulerMaruyama, Integrator, RungeKutta4},
+    integrators::{EulerMaruyama, Integrator, RungeKutta4, Subcycling},
     physics::{
         model::{NoNoise, Wiener},
         phasefield::ModelC,
@@ -182,9 +183,102 @@ fn config() -> Criterion {
     }
 }
 
+/// The AMR machinery: the Berger–Rigoutsos kernel on an interface-shaped
+/// flag set, and a whole adaptive Model C step (amortized regrids,
+/// migration, intergrid transfers included).
+fn amr(c: &mut Criterion) {
+    c.bench_function("amr/cluster/interface_ring", |b| {
+        // A ring of flagged cells, the shape interface tracking produces.
+        let flags: Vec<[i64; 2]> = (0..128 * 128)
+            .map(|i| [i % 128, i / 128])
+            .filter(|&[x, y]| {
+                let (dx, dy) = ((x - 64) as f64, (y - 64) as f64);
+                let r = dx.hypot(dy);
+                (40.0..44.0).contains(&r)
+            })
+            .collect();
+        let params = ClusterParams {
+            efficiency: 0.8,
+            min_width: 4,
+        };
+        b.iter(|| {
+            let mut work = flags.clone();
+            cluster(&mut work, &params)
+        });
+    });
+
+    c.bench_function("amr/step/model_c_adaptive", |b| {
+        let base = CartesianGrid::new([N; 2], [N / 2; 2], [0.0; 2], [H; 2]).unwrap();
+        let grid = AmrGrid::from_patches(base, &[2], &[]).unwrap();
+        let mut sim = Simulation::adaptive(
+            grid,
+            FiniteVolume::default(),
+            ModelC::<NoNoise>::classic(),
+            EulerMaruyama { seed: 7 },
+            SerialScheduler,
+            SystemAllocator,
+            BergerOliger::new(
+                GradientTagger {
+                    field: "phi",
+                    threshold: 0.15,
+                },
+                RegridPolicy {
+                    every: 4,
+                    buffer: 2,
+                    cluster: ClusterParams {
+                        efficiency: 0.8,
+                        min_width: 4,
+                    },
+                },
+            ),
+        );
+        let dt = sim.stable_dt().unwrap();
+        {
+            let model = sim.model().clone();
+            let (grid, state) = sim.state_mut();
+            model.initialize(grid.base(), state, [H, H], 10.0 * H, 0.7);
+        }
+        b.iter(|| sim.step(dt));
+    });
+
+    c.bench_function("amr/step/model_c_subcycled", |b| {
+        let base = CartesianGrid::new([N; 2], [N / 2; 2], [0.0; 2], [H; 2]).unwrap();
+        let grid = AmrGrid::from_patches(base, &[2], &[]).unwrap();
+        let mut sim = Simulation::adaptive(
+            grid,
+            FiniteVolume::default(),
+            ModelC::<NoNoise>::classic(),
+            Subcycling { seed: 7 },
+            SerialScheduler,
+            SystemAllocator,
+            BergerOliger::new(
+                GradientTagger {
+                    field: "phi",
+                    threshold: 0.15,
+                },
+                RegridPolicy {
+                    every: 4,
+                    buffer: 2,
+                    cluster: ClusterParams {
+                        efficiency: 0.8,
+                        min_width: 4,
+                    },
+                },
+            ),
+        );
+        let dt = sim.stable_dt().unwrap();
+        {
+            let model = sim.model().clone();
+            let (grid, state) = sim.state_mut();
+            model.initialize(grid.base(), state, [H, H], 10.0 * H, 0.7);
+        }
+        b.iter(|| sim.step(dt));
+    });
+}
+
 criterion_group! {
     name = benches;
     config = config();
-    targets = integrator_steps, primitives
+    targets = integrator_steps, primitives, amr
 }
 criterion_main!(benches);

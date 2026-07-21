@@ -98,9 +98,9 @@ fn snapshot_roundtrips_exactly() {
         .with_static(vec![("theta0", theta)]);
 
     // Cadence: step 1 always fires; step 3 is skipped; step 4 fires.
-    obs.observe(1, 0.25, &state);
-    obs.observe(3, 0.75, &state);
-    obs.observe(4, 1.0, &state);
+    obs.observe(1, 0.25, 0, &grid, &state);
+    obs.observe(3, 0.75, 0, &grid, &state);
+    obs.observe(4, 1.0, 0, &grid, &state);
 
     let static_path = dir.path().join("static_0000000.parquet");
     let snap1 = dir.path().join("snap_0000001.parquet");

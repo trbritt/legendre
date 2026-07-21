@@ -14,22 +14,67 @@ use crate::{
         scheduler::Scheduler,
         scratch::ScratchPool,
         state::{State, StateBuilder},
-        storage::Allocator,
+        storage::{Allocator, Scalar, StorageBackend},
     },
     geometry::grid::Grid,
     integrators::{Integrator, StageKind},
     physics::model::{DriverSet, Model},
 };
 
+/// An adaptivity policy: decides whether and how to rebuild the grid.
+///
+/// All refinement knowledge — tagging, clustering, nesting, state
+/// migration — lives in implementations of this trait, none in
+/// [`Simulation`]: `regrid` returns the new grid **and the already
+/// migrated state**, so the simulation only swaps values and rebuilds its
+/// stage buffers. `state` is borrowed mutably so policies may make it
+/// consistent (restriction, ghost fills) before tagging; the returned
+/// state replaces it either way.
+pub trait Adapt<G, T: Scalar, S: StorageBackend<T>, A>: Send + Sync {
+    /// Called at the top of every step with the number of completed
+    /// steps. `None` means keep stepping on the current grid.
+    fn regrid(
+        &mut self,
+        grid: &G,
+        state: &mut State<T, S>,
+        alloc: &A,
+        step: u64,
+    ) -> Option<(G, State<T, S>)>;
+}
+
+/// The default policy: never adapts. `regrid` monomorphizes to `None`, so
+/// uniform-grid simulations pay nothing and keep every existing signature
+/// through the default type parameter.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Static;
+
+impl<G, T: Scalar, S: StorageBackend<T>, A> Adapt<G, T, S, A> for Static {
+    #[inline(always)]
+    fn regrid(
+        &mut self,
+        _grid: &G,
+        _state: &mut State<T, S>,
+        _alloc: &A,
+        _step: u64,
+    ) -> Option<(G, State<T, S>)> {
+        None
+    }
+}
+
+/// The boxed observer list of a simulation (see [`Observer`]).
+type Observers<G, T, S> = Vec<Box<dyn Observer<G, T, S>>>;
+
 /// Sole owner of every simulation component; see the module docs.
-pub struct Simulation<G, D, M, I, Sch, A>
+pub struct Simulation<G, D, M, I, Sch, A, R = Static>
 where
     G: Grid,
     M: Model<G, D>,
     I: Integrator<G, D, M::Drivers>,
     Sch: Scheduler,
     A: Allocator<M::Scalar>,
+    R: Adapt<G, M::Scalar, A::Storage, A>,
 {
+    adapt: R,
     grid: G,
     disc: D,
     model: M,
@@ -39,9 +84,10 @@ where
     state: State<M::Scalar, A::Storage>,
     stages: Vec<State<M::Scalar, A::Storage>>,
     pool: ScratchPool<M::Scalar, A::Storage>,
-    observers: Vec<Box<dyn Observer<M::Scalar, A::Storage>>>,
+    observers: Observers<G, M::Scalar, A::Storage>,
     t: f64,
     step_index: u64,
+    epoch: u64,
 }
 
 impl<G, D, M, I, Sch, A> Simulation<G, D, M, I, Sch, A>
@@ -52,15 +98,50 @@ where
     Sch: Scheduler,
     A: Allocator<M::Scalar>,
 {
-    /// Register the model's fields, allocate state and stage buffers, and
-    /// assemble. The only allocating path in a simulation's lifetime.
+    /// A non-adaptive simulation (the [`Static`] policy): register the
+    /// model's fields, allocate state and stage buffers, and assemble.
+    ///
+    /// # Panics
+    ///
+    /// See [`Simulation::adaptive`].
+    pub fn new(grid: G, disc: D, model: M, integrator: I, scheduler: Sch, alloc: A) -> Self {
+        Self::adaptive(grid, disc, model, integrator, scheduler, alloc, Static)
+    }
+}
+
+impl<G, D, M, I, Sch, A, R> Simulation<G, D, M, I, Sch, A, R>
+where
+    G: Grid,
+    M: Model<G, D>,
+    I: Integrator<G, D, M::Drivers>,
+    Sch: Scheduler,
+    A: Allocator<M::Scalar>,
+    R: Adapt<G, M::Scalar, A::Storage, A>,
+{
+    /// A simulation with an adaptivity policy consulted at the top of
+    /// every step; on a regrid the policy's migrated state replaces the
+    /// current one and stage buffers and scratch are reallocated (the
+    /// only allocating path after construction, amortized over the regrid
+    /// interval).
+    ///
+    /// Observers are not yet regrid-aware: an observer that captured grid
+    /// geometry at attach time (e.g. the Parquet writer) will not follow
+    /// grid changes.
     ///
     /// # Panics
     ///
     /// Panics if the model declares a stochastic driver that no field is
     /// registered as driven by — that term would silently apply to
     /// nothing (see [`StateBuilder::register_driven`]).
-    pub fn new(grid: G, disc: D, mut model: M, integrator: I, scheduler: Sch, alloc: A) -> Self {
+    pub fn adaptive(
+        grid: G,
+        disc: D,
+        mut model: M,
+        integrator: I,
+        scheduler: Sch,
+        alloc: A,
+        adapt: R,
+    ) -> Self {
         let mut builder = StateBuilder::new();
         model.register_fields(&mut builder);
         let state = builder.build(&grid, &alloc);
@@ -76,21 +157,14 @@ where
                  as driven by it; use StateBuilder::register_driven"
             );
         }
-        let stages = integrator
-            .stage_layout()
-            .stages
-            .iter()
-            .map(|kind| match *kind {
-                StageKind::Tendency(driver) => state.like_for(&grid, &alloc, driver),
-                StageKind::State => state.like(&grid, &alloc),
-            })
-            .collect();
+        let stages = Self::build_stages(&integrator, &state, &grid, &alloc);
         let pool = ScratchPool::allocate(
             model.scratch_spec(&grid),
             &alloc,
             scheduler.max_concurrency(),
         );
         Self {
+            adapt,
             grid,
             disc,
             model,
@@ -103,12 +177,38 @@ where
             observers: Vec::new(),
             t: 0.0,
             step_index: 0,
+            epoch: 0,
         }
     }
 
-    /// Register an observer to be notified after every completed step.
-    pub fn attach_observer(&mut self, observer: Box<dyn Observer<M::Scalar, A::Storage>>) {
+    /// Allocate the integrator's stage buffers for `state` on `grid` —
+    /// used at construction and again after every regrid.
+    fn build_stages(
+        integrator: &I,
+        state: &State<M::Scalar, A::Storage>,
+        grid: &G,
+        alloc: &A,
+    ) -> Vec<State<M::Scalar, A::Storage>> {
+        integrator
+            .stage_layout(grid)
+            .stages
+            .iter()
+            .map(|kind| match *kind {
+                StageKind::Tendency(driver) => state.like_for(grid, alloc, driver),
+                StageKind::State => state.like(grid, alloc),
+            })
+            .collect()
+    }
+
+    /// Register an observer to be notified after every completed step
+    /// with the current grid and epoch.
+    pub fn attach_observer(&mut self, observer: Box<dyn Observer<G, M::Scalar, A::Storage>>) {
         self.observers.push(observer);
+    }
+
+    /// Grid generation: 0 at construction, +1 per adaptive regrid.
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// The grid this simulation runs on.
@@ -148,8 +248,25 @@ where
             .collect()
     }
 
-    /// Advance one step of size `dt`, then notify observers.
+    /// Advance one step of size `dt`, then notify observers. Consults
+    /// the adaptivity policy first; a regrid swaps grid and state and
+    /// rebuilds stage buffers and scratch before stepping.
     pub fn step(&mut self, dt: f64) {
+        if let Some((grid, state)) =
+            self.adapt
+                .regrid(&self.grid, &mut self.state, &self.alloc, self.step_index)
+        {
+            self.grid = grid;
+            self.state = state;
+            self.epoch += 1;
+            self.stages =
+                Self::build_stages(&self.integrator, &self.state, &self.grid, &self.alloc);
+            self.pool = ScratchPool::allocate(
+                self.model.scratch_spec(&self.grid),
+                &self.alloc,
+                self.scheduler.max_concurrency(),
+            );
+        }
         self.integrator.step(
             &self.model,
             &self.grid,
@@ -164,12 +281,15 @@ where
         self.t += dt;
         self.step_index += 1;
         for obs in &mut self.observers {
-            obs.observe(self.step_index, self.t, &self.state);
+            obs.observe(self.step_index, self.t, self.epoch, &self.grid, &self.state);
         }
     }
 
-    /// Advisory stable dt from the model, if it declares one.
+    /// Advisory timestep for this simulation's integrator on its grid,
+    /// derived from the model's stability law — the finest-cell dt for a
+    /// global-dt scheme, the coarsest-level dt for a subcycling one (see
+    /// [`Integrator::suggested_dt`]).
     pub fn stable_dt(&self) -> Option<f64> {
-        self.model.stable_dt(&self.grid)
+        self.integrator.suggested_dt(&self.model, &self.grid)
     }
 }

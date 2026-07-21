@@ -82,6 +82,13 @@ pub trait Grid: Send + Sync + 'static {
     /// Cell spacing on this block (level-dependent under AMR).
     fn spacing(&self, block: BlockId) -> Self::Point;
 
+    /// The finest cell spacing this grid can ever have — its own spacing
+    /// for a uniform grid, the spacing at the deepest level the refinement
+    /// capacity allows for an AMR grid (even before that level is
+    /// populated). A global-dt integrator picks its timestep from this so
+    /// the run stays stable when a regrid later introduces fine patches.
+    fn finest_spacing(&self) -> Self::Point;
+
     /// Physical coordinates of a cell center.
     fn cell_center(&self, block: BlockId, idx: Self::Index) -> Self::Point;
 
@@ -115,4 +122,14 @@ pub trait Grid: Send + Sync + 'static {
         ghost: u32,
         data: &'a mut [T],
     ) -> Self::ViewMut<'a, T>;
+}
+
+/// Grid families whose blocks are axis-aligned boxes of cells.
+///
+/// The accessor IO sinks and other family-generic glue need to iterate a
+/// block's interior without knowing the concrete grid type; both the
+/// uniform Cartesian grid and AMR patch hierarchies implement it.
+pub trait BoxedBlocks<const D: usize>: Grid<Point = [f64; D], Index = [isize; D]> {
+    /// Interior cells per dimension of one block.
+    fn block_extent(&self, block: BlockId) -> [usize; D];
 }

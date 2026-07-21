@@ -1,4 +1,9 @@
-//! Finite-volume discretizations on Cartesian grids.
+//! Finite-volume discretizations on rectilinear grids.
+//!
+//! Kernels operate on the concrete Cartesian box views, so every grid
+//! family whose blocks are uniform boxes (the Cartesian grid, AMR patches)
+//! shares one implementation; per-grid `Stencil`/`Discretizes` impls are
+//! thin shims.
 //!
 //! First member: the Karma–Rappel anisotropic divergence used by
 //! phase-field solidification models (Karma & Rappel, PRE 57, 4323 (1998)).
@@ -21,12 +26,13 @@ use crate::{
     core::storage::Real,
     discretization::finite_difference::CentralLaplacian,
     geometry::{
-        cartesian::{CartesianGrid, for_each_interior},
+        amr::AmrGrid,
+        cartesian::{CartesianGrid, CartesianView, CartesianViewMut, for_each_interior},
         grid::{BlockId, Grid},
     },
 };
 
-/// Finite-volume policy on Cartesian grids.
+/// Finite-volume policy on rectilinear grids.
 ///
 /// `tol` is the |∇φ|⁴ threshold below which the anisotropy is taken
 /// isotropic (the interface-free limit), a purely numerical regularization —
@@ -63,6 +69,27 @@ impl<const D: usize> Discretizes<CartesianGrid<D>, Laplacian> for FiniteVolume {
     type Stencil = CentralLaplacian;
 
     fn build(&self, _grid: &CartesianGrid<D>, _op: Laplacian) -> CentralLaplacian {
+        CentralLaplacian
+    }
+}
+
+impl Discretizes<AmrGrid<2>, AnisotropicDivergence> for FiniteVolume {
+    type Stencil = KarmaRappelFlux;
+
+    fn build(&self, grid: &AmrGrid<2>, op: AnisotropicDivergence) -> KarmaRappelFlux {
+        let [hx, hy] = grid.spacing(BlockId(0));
+        debug_assert!(
+            (hx - hy).abs() < 1e-12 * hx.abs(),
+            "Karma-Rappel flux assumes isotropic spacing"
+        );
+        KarmaRappelFlux::new(op.eps4, self.tol)
+    }
+}
+
+impl<const D: usize> Discretizes<AmrGrid<D>, Laplacian> for FiniteVolume {
+    type Stencil = CentralLaplacian;
+
+    fn build(&self, _grid: &AmrGrid<D>, _op: Laplacian) -> CentralLaplacian {
         CentralLaplacian
     }
 }
@@ -120,7 +147,7 @@ impl KarmaRappelFlux {
     #[must_use]
     pub fn center_anisotropy<T: Real>(
         &self,
-        input: &<CartesianGrid<2> as Grid>::View<'_, T>,
+        input: &CartesianView<'_, T, 2>,
         idx: [isize; 2],
     ) -> T {
         let [i, j] = idx;
@@ -135,7 +162,7 @@ impl KarmaRappelFlux {
     #[inline(always)]
     pub fn center_anisotropy_rotated<T: Real>(
         &self,
-        input: &<CartesianGrid<2> as Grid>::View<'_, T>,
+        input: &CartesianView<'_, T, 2>,
         idx: [isize; 2],
         cos0: T,
         sin0: T,
@@ -164,13 +191,11 @@ impl KarmaRappelFlux {
     /// approximate anyway).
     pub fn apply_oriented<T: Real>(
         &self,
-        grid: &CartesianGrid<2>,
-        block: BlockId,
-        input: <CartesianGrid<2> as Grid>::View<'_, T>,
-        orientation: <CartesianGrid<2> as Grid>::View<'_, T>,
-        output: &mut <CartesianGrid<2> as Grid>::ViewMut<'_, T>,
+        [hx, hy]: [f64; 2],
+        input: CartesianView<'_, T, 2>,
+        orientation: CartesianView<'_, T, 2>,
+        output: &mut CartesianViewMut<'_, T, 2>,
     ) {
-        let [hx, hy] = grid.spacing(block);
         let inv_h2 = T::from_f64(1.0 / (hx * hy));
         let quarter = T::from_f64(0.25);
         let p = |i: isize, j: isize| input.get([i, j]);
@@ -217,19 +242,15 @@ fn rotate<T: Real>(cos0: T, sin0: T, dx: T, dy: T) -> (T, T) {
     (cos0 * dx + sin0 * dy, cos0 * dy - sin0 * dx)
 }
 
-impl Stencil<CartesianGrid<2>> for KarmaRappelFlux {
-    fn ghost_width(&self) -> u32 {
-        1
-    }
-
-    fn apply<T: Real>(
+impl KarmaRappelFlux {
+    /// The axis-aligned kernel behind `Stencil::apply` for every
+    /// rectilinear grid family.
+    fn kernel<T: Real>(
         &self,
-        grid: &CartesianGrid<2>,
-        block: BlockId,
-        input: <CartesianGrid<2> as Grid>::View<'_, T>,
-        output: &mut <CartesianGrid<2> as Grid>::ViewMut<'_, T>,
+        [hx, hy]: [f64; 2],
+        input: &CartesianView<'_, T, 2>,
+        output: &mut CartesianViewMut<'_, T, 2>,
     ) {
-        let [hx, hy] = grid.spacing(block);
         let inv_h2 = T::from_f64(1.0 / (hx * hy));
         let quarter = T::from_f64(0.25);
         let p = |i: isize, j: isize| input.get([i, j]);
@@ -260,5 +281,37 @@ impl Stencil<CartesianGrid<2>> for KarmaRappelFlux {
 
             output.set([i, j], (j_r - j_l + j_t - j_b) * inv_h2);
         });
+    }
+}
+
+impl Stencil<CartesianGrid<2>> for KarmaRappelFlux {
+    fn ghost_width(&self) -> u32 {
+        1
+    }
+
+    fn apply<T: Real>(
+        &self,
+        grid: &CartesianGrid<2>,
+        block: BlockId,
+        input: <CartesianGrid<2> as Grid>::View<'_, T>,
+        output: &mut <CartesianGrid<2> as Grid>::ViewMut<'_, T>,
+    ) {
+        self.kernel(grid.spacing(block), &input, output);
+    }
+}
+
+impl Stencil<AmrGrid<2>> for KarmaRappelFlux {
+    fn ghost_width(&self) -> u32 {
+        1
+    }
+
+    fn apply<T: Real>(
+        &self,
+        grid: &AmrGrid<2>,
+        block: BlockId,
+        input: <AmrGrid<2> as Grid>::View<'_, T>,
+        output: &mut <AmrGrid<2> as Grid>::ViewMut<'_, T>,
+    ) {
+        self.kernel(grid.spacing(block), &input, output);
     }
 }

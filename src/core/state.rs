@@ -317,6 +317,46 @@ impl<T: Scalar, S: StorageBackend<T>> State<T, S> {
         self.like_impl(grid, alloc, |spec| spec.is_driven_by(driver))
     }
 
+    /// A buffer with this state's layout allocated over a *different*
+    /// grid's block structure — the regrid migration target. Carries
+    /// every field (statics included); the shared layout keeps existing
+    /// [`FieldHandle`]s valid on the new state.
+    #[must_use]
+    pub fn reshaped<G: Grid, A: Allocator<T, Storage = S>>(&self, grid: &G, alloc: &A) -> Self {
+        let blocks = (0..grid.num_blocks())
+            .map(|b| BlockStorage::allocate(&self.layout, grid, BlockId(b as u32), alloc, |_| true))
+            .collect();
+        Self {
+            layout: Arc::clone(&self.layout),
+            blocks,
+        }
+    }
+
+    /// Mint the handle of the field at `index` (regrid migration sweeps
+    /// every field without knowing the model's handles). Kept crate-only:
+    /// the builder remains the sole public mint.
+    pub(crate) const fn handle_at(index: usize) -> FieldHandle<T> {
+        FieldHandle {
+            index,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Handle of the field registered under `name`, if any — how
+    /// components constructed *before* field registration (adaptivity
+    /// taggers, observers) resolve the fields they act on.
+    #[must_use]
+    pub fn field(&self, name: &str) -> Option<FieldHandle<T>> {
+        self.layout
+            .specs()
+            .iter()
+            .position(|s| s.name == name)
+            .map(|index| FieldHandle {
+                index,
+                _marker: PhantomData,
+            })
+    }
+
     fn like_impl<G: Grid, A: Allocator<T, Storage = S>>(
         &self,
         grid: &G,
@@ -589,6 +629,60 @@ impl<T: Real, S: StorageBackend<T>> State<T, S> {
             &mut self.blocks,
             || (),
             |id, mine, ()| {
+                block_apply_driver(
+                    grid,
+                    layout,
+                    mine,
+                    &drift.blocks[id.index()],
+                    id,
+                    Driver::Time,
+                    dt,
+                    seed,
+                    salt,
+                );
+                for (i, amp) in stochastic.iter().enumerate() {
+                    block_apply_driver(
+                        grid,
+                        layout,
+                        mine,
+                        &amp.blocks[id.index()],
+                        id,
+                        N::driver(i),
+                        dt,
+                        seed,
+                        salt,
+                    );
+                }
+            },
+        );
+    }
+
+    /// [`State::apply_step_with`] restricted to blocks at refinement
+    /// `level` — the Berger–Oliger per-level state update. Blocks at other
+    /// levels are left untouched; noise keys still use absolute block ids,
+    /// so a fine level's increments never collide with a coarse level's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_step_level<G: Grid, N: DriverSet, Sch: Scheduler>(
+        &mut self,
+        scheduler: &Sch,
+        grid: &G,
+        drift: &Self,
+        stochastic: &[Self],
+        dt: f64,
+        seed: u64,
+        salt: u64,
+        level: u8,
+    ) {
+        debug_assert!(Arc::ptr_eq(&self.layout, &drift.layout));
+        debug_assert_eq!(stochastic.len(), N::LEN);
+        let layout = &self.layout;
+        scheduler.for_each_block_mut(
+            &mut self.blocks,
+            || (),
+            |id, mine, ()| {
+                if grid.level(id) != level {
+                    return;
+                }
                 block_apply_driver(
                     grid,
                     layout,

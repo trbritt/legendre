@@ -1,6 +1,7 @@
 //! Grids and topology: the `Grid` trait and concrete grid families.
-//! Quadtree/octree AMR grids land here later behind the same trait.
+//! Block-structured AMR grids land here behind the same trait.
 
+pub mod amr;
 pub mod cartesian;
 pub mod grid;
 
@@ -29,5 +30,41 @@ pub enum GridError {
         dimension: usize,
         /// The rejected spacing value.
         spacing: f64,
+    },
+    /// AMR refinement ratios must be ≥ 2, one per level transition.
+    #[error("invalid AMR ratios: {levels} refined levels, {ratios} ratios (each must be >= 2)")]
+    AmrRatio {
+        /// Refined levels requested.
+        levels: usize,
+        /// Ratios supplied.
+        ratios: usize,
+    },
+    /// An AMR patch has zero cells.
+    #[error("empty AMR patch at level {level}")]
+    AmrEmptyPatch {
+        /// The offending level.
+        level: u8,
+    },
+    /// Two same-level AMR patches overlap.
+    #[error("overlapping AMR patches at level {level}")]
+    AmrOverlap {
+        /// The offending level.
+        level: u8,
+    },
+    /// An AMR patch's box is not aligned to its refinement ratio
+    /// (both `lo` and `hi` must be multiples of the level's ratio, so
+    /// every coarse cell is either fully refined or not at all).
+    #[error("AMR patch at level {level} is not aligned to its refinement ratio")]
+    AmrMisaligned {
+        /// The offending level.
+        level: u8,
+    },
+    /// An AMR patch violates proper nesting (Berger–Oliger: coarsened and
+    /// grown by one cell, it must lie in the union of the level below,
+    /// except at the physical domain boundary).
+    #[error("AMR patch at level {level} is not properly nested in the level below")]
+    AmrNotNested {
+        /// The offending level.
+        level: u8,
     },
 }

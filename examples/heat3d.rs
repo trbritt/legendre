@@ -78,8 +78,7 @@ impl<P: Discretizes<CartesianGrid<3>, Laplacian>> Model<CartesianGrid<3>, P> for
         });
     }
 
-    fn stable_dt(&self, grid: &CartesianGrid<3>) -> Option<f64> {
-        let h = grid.spacing(BlockId(0));
+    fn stable_dt(&self, h: [f64; 3]) -> Option<f64> {
         let min_h = h.iter().copied().fold(f64::MAX, f64::min);
         Some(0.8 / 6.0 * min_h * min_h / self.kappa) // r_total = 0.4 < 0.5
     }

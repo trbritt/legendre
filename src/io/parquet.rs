@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! run_dir/
-//! ├── static_0000000.parquet   x, y[, z], static fields (θ₀, …)  — one per grid epoch
+//! ├── static_0000000.parquet   x, y[, z], level, patch, static fields (θ₀, …) — one per grid epoch
 //! ├── snap_0000001.parquet     step, t, epoch, dynamic fields
 //! ├── snap_0004000.parquet     …
 //! ```
@@ -16,8 +16,10 @@
 //! Every snapshot carries a constant `epoch` column (RLE-encoded, ~free)
 //! naming the static file its rows align with. A uniform-grid run has
 //! exactly one epoch; under AMR each regrid bumps the epoch and emits a
-//! fresh static file, so the on-disk contract already accommodates
-//! refinement. This cuts both steady-state disk and — more importantly —
+//! fresh static file — the observer is grid-aware ([`Observer`] receives
+//! the current grid and epoch) so adaptive runs work end to end. The
+//! per-cell `level` and `patch` columns let renderers composite
+//! finest-wins and draw patch outlines; a uniform grid writes level 0. This cuts both steady-state disk and — more importantly —
 //! the writer's transient memory, which previously materialized coordinate
 //! columns for every snapshot.
 //!
@@ -39,8 +41,8 @@ use crate::{
         storage::StorageBackend,
     },
     geometry::{
-        cartesian::{CartesianGrid, for_each_interior},
-        grid::{BlockId, Grid},
+        cartesian::for_each_interior,
+        grid::{BlockId, BoxedBlocks},
     },
     io::ObserverError,
 };
@@ -59,8 +61,8 @@ const ROWS_PER_GROUP: usize = 1 << 22;
 
 /// Writes state snapshots as Parquet files; see the module docs for the
 /// on-disk layout.
-pub struct ParquetObserver<const D: usize = 2> {
-    grid: CartesianGrid<D>,
+pub struct ParquetObserver<G, const D: usize = 2> {
+    grid: G,
     dynamic: Vec<(&'static str, FieldHandle<f64>)>,
     statics: Vec<(&'static str, FieldHandle<f64>)>,
     every: u64,
@@ -72,7 +74,7 @@ pub struct ParquetObserver<const D: usize = 2> {
     static_written: bool,
 }
 
-impl<const D: usize> ParquetObserver<D> {
+impl<G: BoxedBlocks<D>, const D: usize> ParquetObserver<G, D> {
     /// Snapshot the *dynamic* `fields` every `every` steps (plus step 1)
     /// into `dir`. Coordinates are always emitted to the per-epoch static
     /// file; add time-invariant fields to it with [`Self::with_static`].
@@ -82,7 +84,7 @@ impl<const D: usize> ParquetObserver<D> {
     /// Returns an [`ObserverError`] if `D` is not 1, 2, or 3, if `fields`
     /// is empty, or if `dir` cannot be created.
     pub fn new(
-        grid: CartesianGrid<D>,
+        grid: G,
         fields: Vec<(&'static str, FieldHandle<f64>)>,
         every: u64,
         dir: impl Into<PathBuf>,
@@ -148,9 +150,13 @@ impl<const D: usize> ParquetObserver<D> {
         let file = File::create(path)?;
         let mut writer = SerializedFileWriter::new(file, schema, self.props.clone())?;
 
-        let block_cells: usize = self.grid.block_cells().iter().product();
-        let cap = ROWS_PER_GROUP + block_cells;
-        let n_coords = if with_coords { D } else { 0 };
+        let max_block_cells: usize = (0..self.grid.num_blocks())
+            .map(|b| self.grid.block_extent(BlockId(b as u32)).iter().product())
+            .max()
+            .unwrap_or(0);
+        let cap = ROWS_PER_GROUP + max_block_cells;
+        // Coordinate columns plus per-cell level and patch metadata.
+        let n_coords = if with_coords { D + 2 } else { 0 };
         let mut bufs: Vec<Vec<f64>> = (0..n_coords + fields.len())
             .map(|_| Vec::with_capacity(cap))
             .collect();
@@ -178,17 +184,34 @@ impl<const D: usize> ParquetObserver<D> {
 
         for b in 0..self.grid.num_blocks() {
             let block = BlockId(b as u32);
+            let extent = self.grid.block_extent(block);
             if with_coords {
-                for_each_interior(self.grid.block_cells(), |idx| {
+                let level = f64::from(self.grid.level(block));
+                for_each_interior(extent, |idx| {
                     let center = self.grid.cell_center(block, idx);
                     for (d, buf) in bufs[..D].iter_mut().enumerate() {
                         buf.push(center[d]);
                     }
+                    bufs[D].push(level);
+                    bufs[D + 1].push(b as f64);
                 });
             }
             for ((_, handle), buf) in fields.iter().zip(&mut bufs[n_coords..]) {
-                let v = state.view(&self.grid, block, *handle);
-                for_each_interior(self.grid.block_cells(), |idx| buf.push(v.get(idx)));
+                // Read the slab directly (views are grid-associated types
+                // this generic code cannot name): dimension-0-fastest
+                // ghost-inclusive layout, the allocation contract every
+                // `BoxedBlocks` grid upholds.
+                let ghost = state.layout().ghost(handle.index()) as usize;
+                let slab = state.slab(block, *handle);
+                for_each_interior(extent, |idx| {
+                    let mut off = 0usize;
+                    let mut stride = 1usize;
+                    for d in 0..D {
+                        off += (idx[d] as usize + ghost) * stride;
+                        stride *= extent[d] + 2 * ghost;
+                    }
+                    buf.push(slab[off]);
+                });
             }
             if bufs[0].len() >= ROWS_PER_GROUP {
                 flush(&mut bufs)?;
@@ -208,6 +231,8 @@ impl<const D: usize> ParquetObserver<D> {
             .iter()
             .map(|n| format!("required double {n};\n"))
             .collect();
+        cols.push("required double level;\n".to_string());
+        cols.push("required double patch;\n".to_string());
         cols.extend(
             self.statics
                 .iter()
@@ -286,10 +311,26 @@ impl<const D: usize> ParquetObserver<D> {
     }
 }
 
-impl<S: StorageBackend<f64>, const D: usize> Observer<f64, S> for ParquetObserver<D> {
-    fn observe(&mut self, step: u64, t: f64, state: &State<f64, S>) {
+impl<G, S, const D: usize> Observer<G, f64, S> for ParquetObserver<G, D>
+where
+    G: BoxedBlocks<D> + Clone,
+    S: StorageBackend<f64>,
+{
+    fn observe(&mut self, step: u64, t: f64, epoch: u64, grid: &G, state: &State<f64, S>) {
         if step != 1 && !step.is_multiple_of(self.every) {
+            // Note the epoch even when skipping, but clone the (possibly
+            // large) grid only when a snapshot will actually be written —
+            // regrids can be far more frequent than snapshots.
+            if epoch != self.epoch {
+                self.epoch = epoch;
+                self.static_written = false;
+            }
             return;
+        }
+        if epoch != self.epoch || !self.static_written {
+            self.grid = grid.clone();
+            self.epoch = epoch;
+            self.static_written = false;
         }
         if let Err(e) = self.write_snapshot(step, t, state) {
             tracing::error!(step, "parquet snapshot failed: {e:#}");
@@ -300,7 +341,9 @@ impl<S: StorageBackend<f64>, const D: usize> Observer<f64, S> for ParquetObserve
 /// As a [`SnapshotSink`] the observer writes every snapshot it receives —
 /// cadence is owned by the [`crate::core::observer::AsyncObserver`] feeding
 /// it (construct with `every = 1` in that case).
-impl<S: StorageBackend<f64>, const D: usize> SnapshotSink<f64, S> for ParquetObserver<D> {
+impl<G: BoxedBlocks<D>, S: StorageBackend<f64>, const D: usize> SnapshotSink<f64, S>
+    for ParquetObserver<G, D>
+{
     fn consume(&mut self, step: u64, t: f64, state: &State<f64, S>) {
         if let Err(e) = self.write_snapshot(step, t, state) {
             tracing::error!(step, "parquet snapshot failed: {e:#}");

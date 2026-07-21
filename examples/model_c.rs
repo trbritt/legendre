@@ -28,8 +28,12 @@ use legendre::{
         storage::{DenseStorage, SystemAllocator},
     },
     discretization::finite_volume::FiniteVolume,
-    geometry::{cartesian::CartesianGrid, grid::Grid},
-    integrators::{EulerMaruyama, Integrator, RungeKutta4},
+    geometry::{
+        amr::{AmrGrid, BergerOliger, ClusterParams, GradientTagger, RegridPolicy},
+        cartesian::CartesianGrid,
+        grid::Grid,
+    },
+    integrators::{EulerMaruyama, Integrator, RungeKutta4, Subcycling},
     io::{
         parquet::ParquetObserver,
         progress::{FieldStat, FieldStatsSink, ProgressObserver, progress_bar},
@@ -101,10 +105,54 @@ struct Args {
     /// Time integrator
     #[arg(long, value_enum, default_value_t = Scheme::Em)]
     integrator: Scheme,
+
+    /// Adaptively refine a 2x level over the base grid (Berger-Oliger),
+    /// tracking the interface via |grad phi|. Snapshots carry per-cell
+    /// level/patch columns; render with `--patches` to outline them.
+    #[arg(long)]
+    amr: bool,
+
+    /// With --amr, subcycle in time (Berger-Oliger): the coarse level
+    /// takes big steps, the fine level r²=4 substeps, so the finest dt is
+    /// not imposed on the whole domain. Euler-Maruyama only (not rk4).
+    #[arg(long)]
+    subcycle: bool,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
+    if args.amr {
+        if args.orient {
+            return Err("--amr with --orient is not supported yet (static-field \
+                        migration across regrids blurs theta0)"
+                .into());
+        }
+        if args.subcycle {
+            // Subcycling is single-stage (Euler-Maruyama family) only.
+            if matches!(args.integrator, Scheme::Rk4) {
+                return Err("--subcycle does not support rk4 (multi-stage)".into());
+            }
+            return if args.noise == 0.0 {
+                run_amr::<NoNoise, _>(Subcycling { seed: args.seed }, &args)
+            } else {
+                run_amr::<Wiener<1>, _>(Subcycling { seed: args.seed }, &args)
+            };
+        }
+        return match args.integrator {
+            Scheme::Rk4 => {
+                if args.noise != 0.0 {
+                    return Err(
+                        "--integrator rk4 is deterministic-only; use em with --noise".into(),
+                    );
+                }
+                run_amr::<NoNoise, _>(RungeKutta4, &args)
+            }
+            Scheme::Em if args.noise == 0.0 => {
+                run_amr::<NoNoise, _>(EulerMaruyama { seed: args.seed }, &args)
+            }
+            Scheme::Em => run_amr::<Wiener<1>, _>(EulerMaruyama { seed: args.seed }, &args),
+        };
+    }
     match args.integrator {
         // The driver contract makes RK4 deterministic-only at the type
         // level; a stochastic run must pair --noise with Euler–Maruyama.
@@ -261,6 +309,95 @@ where
 
     println!(
         "done. render with: python3 scripts/render_model_c.py {out}",
+        out = args.out
+    );
+    Ok(())
+}
+
+/// The adaptive run: coarse base grid, one 2x refinement level tracking
+/// the interface. Observation is synchronous (the async snapshot ring
+/// cannot follow regrids), so prefer a generous --every.
+fn run_amr<N, I>(integrator: I, args: &Args) -> Result<(), Box<dyn Error>>
+where
+    N: DriverSet,
+    I: Integrator<AmrGrid<2>, FiniteVolume, N> + 'static,
+{
+    let base = CartesianGrid::new(
+        [args.cells, args.cells],
+        [args.block, args.block],
+        [0.0, 0.0],
+        [H, H],
+    )?;
+    let grid = AmrGrid::from_patches(base, &[2], &[])?;
+    let mut model = ModelC::<N>::classic();
+    model.noise_amplitude = args.noise;
+
+    let mut sim = Simulation::adaptive(
+        grid,
+        FiniteVolume::default(),
+        model,
+        integrator,
+        RayonScheduler,
+        SystemAllocator,
+        BergerOliger::new(
+            GradientTagger {
+                field: "phi",
+                threshold: 0.15,
+            },
+            RegridPolicy {
+                every: 8,
+                buffer: 2,
+                // min_width trades patch-tracking tightness against
+                // work-item granularity; 4 coarse cells hugs the
+                // interface band closely at demo scales.
+                cluster: ClusterParams {
+                    efficiency: 0.8,
+                    min_width: 4,
+                },
+            },
+        ),
+    );
+    let dt = sim.stable_dt().expect("the model declares a stable dt");
+    let steps = (args.time / dt).ceil() as u64;
+
+    let seeds = seed_positions(args);
+    println!(
+        "model_c (AMR): {cells}\u{b2} base cells + one 2x level, {nseeds} seeds, \
+         dt = {dt:.5}, {steps} steps to t = {time}, integrator {scheme:?}, \
+         snapshots every {every} -> {out}/",
+        cells = args.cells,
+        nseeds = seeds.len(),
+        time = args.time,
+        scheme = args.integrator,
+        every = args.every,
+        out = args.out,
+    );
+
+    let (phi_h, u_h) = (sim.model().phi(), sim.model().u());
+    {
+        let model = sim.model().clone();
+        let (grid, state) = sim.state_mut();
+        model.initialize_grains(grid.base(), state, &seeds, 0.7);
+    }
+
+    let bar = progress_bar(steps);
+    bar.enable_steady_tick(std::time::Duration::from_millis(200));
+    let parquet = ParquetObserver::new(
+        sim.grid().clone(),
+        vec![("phi", phi_h), ("u", u_h)],
+        args.every,
+        &args.out,
+    )?;
+    sim.attach_observer(Box::new(ProgressObserver::new(bar)));
+    sim.attach_observer(Box::new(parquet));
+
+    for _ in 0..steps {
+        sim.step(dt);
+    }
+    drop(sim);
+
+    println!(
+        "done. render with: python3 scripts/render_model_c.py {out} --patches",
         out = args.out
     );
     Ok(())

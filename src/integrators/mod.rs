@@ -30,6 +30,7 @@
 mod euler;
 mod euler_maruyama;
 mod rk4;
+mod subcycling;
 
 use crate::{
     core::{scheduler::Scheduler, scratch::ScratchPool, state::State, storage::StorageBackend},
@@ -40,6 +41,7 @@ use crate::{
 pub use euler::ForwardEuler;
 pub use euler_maruyama::EulerMaruyama;
 pub use rk4::RungeKutta4;
+pub use subcycling::Subcycling;
 
 /// One stage buffer a scheme requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,8 +73,23 @@ pub struct StageLayout {
 /// A time-integration scheme for models with driver set `N`; see the
 /// module docs for the contract.
 pub trait Integrator<G: Grid, D, N: DriverSet>: Send + Sync {
-    /// Buffers this scheme needs; called once at setup.
-    fn stage_layout(&self) -> StageLayout;
+    /// Buffers this scheme needs; called at setup and after each regrid.
+    /// Receives the grid so grid-dependent schemes (subcycling needs one
+    /// time-interpolation snapshot per refinement level) can size their
+    /// buffers to the current hierarchy.
+    fn stage_layout(&self, grid: &G) -> StageLayout;
+
+    /// The timestep this scheme would take on `grid`, from the model's
+    /// stability law. The default is the most restrictive cell's stable dt
+    /// (the finest level under AMR) — correct for a global-dt scheme that
+    /// applies one dt everywhere. A subcycling scheme overrides this to
+    /// return the *coarsest* level's dt and refine in time per level.
+    fn suggested_dt<M>(&self, model: &M, grid: &G) -> Option<f64>
+    where
+        M: Model<G, D, Drivers = N>,
+    {
+        model.stable_dt(grid.finest_spacing())
+    }
 
     /// Advance `state` from `t` to `t + dt`. `stages` are the pre-allocated
     /// buffers from [`Integrator::stage_layout`]; `pool` is the
@@ -95,7 +112,10 @@ pub trait Integrator<G: Grid, D, N: DriverSet>: Send + Sync {
         Sch: Scheduler;
 }
 
-/// Dispatch one driver's vector field over all blocks into `out`.
+/// Dispatch one driver's vector field into `out`. If `level` is `Some`,
+/// only blocks at that refinement level are evaluated (the rest are left
+/// untouched) — the primitive Berger–Oliger subcycling steps one level at
+/// a time on; `None` evaluates every block, the global-dt path.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_driver<G, D, M, S, Sch>(
     model: &M,
@@ -107,6 +127,7 @@ fn dispatch_driver<G, D, M, S, Sch>(
     out: &mut State<M::Scalar, S>,
     t: f64,
     driver: Driver,
+    level: Option<u8>,
 ) where
     G: Grid,
     M: Model<G, D>,
@@ -119,6 +140,9 @@ fn dispatch_driver<G, D, M, S, Sch>(
         blocks,
         || pool.checkout(),
         |block, storage, sc| {
+            if level.is_some_and(|l| grid.level(block) != l) {
+                return;
+            }
             let ctx = RhsContext {
                 grid,
                 disc,
@@ -165,6 +189,78 @@ fn eval_drift<G, D, M, S, Sch>(
         out,
         t,
         Driver::Time,
+        None,
+    );
+}
+
+/// Evaluate the drift on **one level's** blocks into `out`, reading the
+/// already-ghost-filled `state`. Unlike [`eval_drift`] this does *not*
+/// fill ghosts — under subcycling the driver fills them separately, with
+/// time interpolation from the coarser level. The Berger–Oliger per-level
+/// RHS evaluation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn eval_drift_level<G, D, M, S, Sch>(
+    model: &M,
+    grid: &G,
+    disc: &D,
+    scheduler: &Sch,
+    pool: &ScratchPool<M::Scalar, S>,
+    state: &State<M::Scalar, S>,
+    out: &mut State<M::Scalar, S>,
+    t: f64,
+    level: u8,
+) where
+    G: Grid,
+    M: Model<G, D>,
+    S: StorageBackend<M::Scalar>,
+    Sch: Scheduler,
+    D: Sync,
+{
+    dispatch_driver(
+        model,
+        grid,
+        disc,
+        scheduler,
+        pool,
+        state,
+        out,
+        t,
+        Driver::Time,
+        Some(level),
+    );
+}
+
+/// [`eval_tendency`] restricted to one level's blocks.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn eval_tendency_level<G, D, M, S, Sch>(
+    model: &M,
+    grid: &G,
+    disc: &D,
+    scheduler: &Sch,
+    pool: &ScratchPool<M::Scalar, S>,
+    state: &State<M::Scalar, S>,
+    amp: &mut State<M::Scalar, S>,
+    t: f64,
+    driver: Driver,
+    level: u8,
+) where
+    G: Grid,
+    M: Model<G, D>,
+    S: StorageBackend<M::Scalar>,
+    Sch: Scheduler,
+    D: Sync,
+{
+    eval_tendency_impl(
+        model,
+        grid,
+        disc,
+        scheduler,
+        pool,
+        state,
+        amp,
+        t,
+        driver,
+        Some(level),
     );
 }
 
@@ -191,6 +287,30 @@ fn eval_tendency<G, D, M, S, Sch>(
     Sch: Scheduler,
     D: Sync,
 {
+    eval_tendency_impl(
+        model, grid, disc, scheduler, pool, state, amp, t, driver, None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eval_tendency_impl<G, D, M, S, Sch>(
+    model: &M,
+    grid: &G,
+    disc: &D,
+    scheduler: &Sch,
+    pool: &ScratchPool<M::Scalar, S>,
+    state: &State<M::Scalar, S>,
+    amp: &mut State<M::Scalar, S>,
+    t: f64,
+    driver: Driver,
+    level: Option<u8>,
+) where
+    G: Grid,
+    M: Model<G, D>,
+    S: StorageBackend<M::Scalar>,
+    Sch: Scheduler,
+    D: Sync,
+{
     // Zeroing is fused into the evaluation dispatch: each work item resets
     // its own block's slabs just before the model fills them, so the
     // buffer is touched once (cache-hot), with one barrier instead of two.
@@ -199,6 +319,9 @@ fn eval_tendency<G, D, M, S, Sch>(
         blocks,
         || pool.checkout(),
         |block, storage, sc| {
+            if level.is_some_and(|l| grid.level(block) != l) {
+                return;
+            }
             storage.fill_zero();
             let ctx = RhsContext {
                 grid,
