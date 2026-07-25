@@ -95,7 +95,7 @@ Every object has exactly one owner and one responsibility:
 
 ### The fundamental unit is the block, not the grid
 
-Even a uniform Cartesian grid is a collection of congruent blocks. This one decision buys cache locality, natural parallel work units, perimeter-local halo exchange, and an execution model that is *unchanged* when adaptive mesh refinement arrives — refinement replaces one block with children; the scheduler never notices.
+Even a uniform Cartesian grid is a collection of congruent blocks. This one decision buys cache locality, natural parallel work units, perimeter-local halo exchange, and an execution model that is *unchanged* by adaptive mesh refinement — refinement replaces one block with children and the scheduler never notices, which is exactly how `AmrGrid` runs behind the same `Grid` trait.
 
 ```
    Grid                    one Block (ghost-inclusive slab)
@@ -233,7 +233,7 @@ Live progress via `indicatif`:
 
 | Layer | Shipped today |
 |---|---|
-| **Geometry** | `CartesianGrid<const D>` (uniform, block-tiled, any dimension, per-dimension periodic wrap via `with_periodic`), signed ghost indexing, dimension-sweep halo exchange with mirror (no-flux) physical boundaries on non-periodic faces, `fill_from_fn` declarative initial conditions |
+| **Geometry** | `CartesianGrid<const D>` (uniform, block-tiled, any dimension, per-dimension periodic wrap via `with_periodic`), signed ghost indexing, dimension-sweep halo exchange with per-face physical boundary conditions on non-periodic faces (`FaceBc` chosen per (dimension, side) via `fill_ghosts_bc`: no-flux mirror, Dirichlet, or prescribed flux — the latter two Cartesian-only for now), `fill_from_fn` declarative initial conditions |
 | **AMR** | Berger–Oliger block-structured refinement behind the same `Grid` trait: `AmrGrid<const D>` patch hierarchies (proper nesting and ratio alignment enforced at construction), Berger–Rigoutsos signature clustering, conservative restriction + bilinear prolongation, and adaptivity as a defaulted `Adapt` policy on `Simulation` (`BergerOliger` + `GradientTagger`; `Static` no-op default). Runs global-dt (any integrator) or **time-subcycled** (`Subcycling`: coarse levels take big steps, finer levels `r²`/`r` substeps derived from the model's stability law, with time-interpolated coarse boundaries) |
 | **Discretization** | `FiniteDifference` (central, 2nd order), `FiniteVolume` (Karma–Rappel anisotropic flux divergence); operator tags `Laplacian`, `Gradient`, `Divergence`, `AnisotropicDivergence` |
 | **Integrators** | `ForwardEuler`, `EulerMaruyama` (√dt-correct stochastic), `RungeKutta4` (O(dt⁴) drift, composable with noise), `Subcycling` (Berger–Oliger refined timestepping on `AmrGrid`) |
@@ -316,6 +316,7 @@ Every layer is pinned by an *exactness* test, not a tolerance hand-wave:
 | Solidification physics | the shipped phase-field model | φ stays in its wells, seed grows, latent heat bounded by the melting point |
 | Halo exchange / mirror BCs | exact ghost values, every layer, cross-block and boundary | cell-exact assertions |
 | Periodic boundaries | topology-level wrap: exact ghosts (multi-block, self-wrap, corners) + periodic eigenmode decay | cell-exact + 1e-10 relative |
+| Boundary conditions | per-face Dirichlet & inhomogeneous-flux ghosts (incl. ghost-width 2), coexistence with halo exchange, block-vs-ghost-width guard, a Dirichlet-walls heat model | cell-exact ghosts; the linear steady profile is a discrete fixed point |
 | AMR patches | stencils on a patch vs. a uniform twin grid; full-fine-tiling run vs. uniform run | bitwise identical |
 | AMR intergrid | linear fields through exchange/prolongation/restriction; migration through copy + prolong paths | exact to 1e-12 |
 | AMR adaptivity | adaptive vs. coarse vs. restricted-fine reference; Model C interface tracked by \|∇φ\| tagging | adaptive strictly beats coarse; interface cells always refined |
@@ -385,8 +386,8 @@ In dependency order — each stage independently testable, none requiring redesi
   order; also unlocks          stencil-as-operator       against the
   adaptive CFL)                + ghost fills)             explicit one)
 
- in parallel:  periodic BCs · upwind/WENO stencil family · Cahn–Hilliard
- later:        multigrid on the block hierarchy · AMR grids · GPU storage backend
+ in parallel:  upwind/WENO stencil family · Cahn–Hilliard
+ later:        multigrid on the block hierarchy · GPU storage backend
 ```
 
 The design rationale lives where it can't rot: as doc comments on the traits themselves (`core/state.rs`, `geometry/grid.rs`, `discretization/operators.rs`, `physics/model.rs`, `core/scheduler.rs`, `core/observer.rs`). Start there.
