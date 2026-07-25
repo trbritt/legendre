@@ -2,6 +2,7 @@
 //! Block-structured AMR grids land here behind the same trait.
 
 pub mod amr;
+pub mod boundary;
 pub mod cartesian;
 pub mod grid;
 
