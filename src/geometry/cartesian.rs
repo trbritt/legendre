@@ -17,9 +17,12 @@ use super::grid::{BlockId, BoxedBlocks, Grid};
 use crate::{
     core::{
         state::{FieldHandle, State},
-        storage::{Scalar, StorageBackend},
+        storage::{Real, Scalar, StorageBackend},
     },
-    geometry::GridError,
+    geometry::{
+        GridError,
+        boundary::{FaceBc, reflect_coord, reflect_steps},
+    },
 };
 
 /// Uniform Cartesian grid of `cells` interior cells tiled by congruent
@@ -341,53 +344,111 @@ pub fn for_each_box<const D: usize>(lo: [isize; D], hi: [isize; D], mut f: impl 
     }
 }
 
-/// Fill one field's ghost cells: halo exchange across interior block faces
-/// — wrapping across the domain in periodic dimensions — and mirror
-/// (no-flux) at the remaining non-periodic physical boundaries.
+/// Fill one field's ghost cells with a per-face boundary condition.
 ///
-/// Works dimension by dimension; each sweep `d` writes only `d`-ghost strips
-/// and reads only `d`-interior strips, spanning the *full* ghost-inclusive
-/// extent in the other dimensions. After all `D` sweeps, edge and corner
-/// ghosts are consistent — explicit face-then-corner copies, generalized
-/// to any block count and dimension (including a periodic dimension spanned
-/// by a single block, which wraps onto itself). Sequential over blocks for
-/// now; the sweeps are embarrassingly parallel per block if this ever shows
-/// up in profiles.
-pub fn fill_ghosts_mirror<T: Scalar, S: StorageBackend<T>, const D: usize>(
+/// Halo exchange across interior block faces — wrapping across the domain in
+/// periodic dimensions — then the physical [`FaceBc`] `bc(dim, side)` at the
+/// remaining non-periodic boundaries (`side` is `-1` for the low face, `+1`
+/// for the high face).
+///
+/// [`fill_ghosts_mirror`] is `|_, _| FaceBc::Mirror`; anything else — a fixed
+/// value, a prescribed flux, a time-dependent forcing built by closing over
+/// the evaluation time — flows through the same sweep at the same cost.
+///
+/// # Panics
+///
+/// Panics if the field's ghost width exceeds a block's interior extent in any
+/// dimension: the mirror/exchange source would then read the block's own
+/// ghost ring (garbage at fill time). Keep `block_cells[d] >= ghost` — for a
+/// biharmonic (ghost 2) field, blocks at least 2 cells thick.
+pub fn fill_ghosts_bc<T, S, const D: usize>(
     grid: &CartesianGrid<D>,
     state: &mut State<T, S>,
     handle: FieldHandle<T>,
-) {
+    bc: impl Fn(usize, isize) -> FaceBc,
+) where
+    T: Real,
+    S: StorageBackend<T>,
+{
+    fill_ghosts_generic(grid, state, handle, |src, dim, side, steps, h| {
+        bc(dim, side).ghost_value(src, steps, h)
+    });
+}
+
+/// Halo exchange plus **mirror (no-flux)** physical boundaries — the common
+/// case (a conservative diffusion field). See [`fill_ghosts_bc`] for the
+/// general per-face boundary condition.
+pub fn fill_ghosts_mirror<T, S, const D: usize>(
+    grid: &CartesianGrid<D>,
+    state: &mut State<T, S>,
+    handle: FieldHandle<T>,
+) where
+    T: Scalar,
+    S: StorageBackend<T>,
+{
+    // Mirror is a pure copy of the reflected interior value, so it needs no
+    // arithmetic and stays on `Scalar` (usable for non-`Real` marker fields).
+    fill_ghosts_generic(grid, state, handle, |src, _, _, _, _| src);
+}
+
+/// The shared sweep skeleton behind every Cartesian ghost fill. `physical`
+/// maps a boundary ghost's mirror-image interior value `src` — with its
+/// `(dim, side)`, the odd cell distance `steps` = 2k+1 to the source, and the
+/// normal spacing `h` — to the ghost value; interior/periodic ghosts are pure
+/// exchange and never consult it. Generic over `Scalar` (the skeleton only
+/// moves values); conditions that do arithmetic pin `Real` in `physical`.
+///
+/// In place, dimension by dimension: each sweep `d` writes only `d`-ghost
+/// strips and reads only `d`-interior strips (plus, in the other dimensions,
+/// already-final ghosts from earlier sweeps), so after all `D` sweeps edge
+/// and corner ghosts are consistent. Serial over blocks by design: ghost fill
+/// is a *surface*-cost operation dominated by the interior stencil work, and
+/// a block-parallel gather/scatter measured *slower* here — the doubled
+/// memory traffic and per-fill dispatch cost more than the parallelism saves.
+fn fill_ghosts_generic<T, S, const D: usize>(
+    grid: &CartesianGrid<D>,
+    state: &mut State<T, S>,
+    handle: FieldHandle<T>,
+    physical: impl Fn(T, usize, isize, i64, f64) -> T,
+) where
+    T: Scalar,
+    S: StorageBackend<T>,
+{
     let ghost = state.layout().ghost(handle.index());
     if ghost == 0 {
         return;
     }
     let g = ghost as isize;
     let n_cells = grid.block_cells();
+    // A ghost layer wider than the block would reflect/exchange onto the
+    // block's own ghost ring (garbage). Guard once, cheaply, in every build.
+    for (d, &extent) in n_cells.iter().enumerate() {
+        assert!(
+            ghost as usize <= extent,
+            "ghost width {ghost} exceeds block extent {extent} in dimension \
+             {d}; blocks must be at least as thick as the widest stencil"
+        );
+    }
+
     for d in 0..D {
-        // Strip extent: ghost range in dimension d, full ghost-inclusive
-        // range everywhere else.
-        let mut lo = [0isize; D];
+        let n = n_cells[d] as isize;
+        let h = grid.spacing(BlockId(0))[d]; // uniform across Cartesian blocks
+        // Strip extent: ghost range in dimension d, full ghost-inclusive range
+        // everywhere else.
+        let mut lo = [-g; D];
         let mut hi = [0isize; D];
         for e in 0..D {
-            lo[e] = -g;
             hi[e] = n_cells[e] as isize + g;
         }
-        let n = n_cells[d] as isize;
         for b in 0..grid.num_blocks() {
             let block = BlockId(b as u32);
             for dir in [-1isize, 1] {
                 // Ghost strip on this side: idx[d] ∈ [-g, 0) or [n, n+g).
                 (lo[d], hi[d]) = if dir < 0 { (-g, 0) } else { (n, n + g) };
-                if let Some(nb) = grid.face_neighbor(block, d, dir) {
-                    // My ghost layer k copies the neighbor's interior:
-                    // low side: idx[d] = -1-k  ←  neighbor n-1-k
-                    // high side: idx[d] = n+k  ←  neighbor k
-                    if nb == block {
-                        // Periodic wrap onto itself (one block spans this
-                        // dimension): same index map, within one slab.
-                        // Sources are d-interior entries, writes are
-                        // d-ghost entries, so nothing read is overwritten.
+                match grid.face_neighbor(block, d, dir) {
+                    Some(nb) if nb == block => {
+                        // Periodic self-wrap: same slab, d-interior source to
+                        // d-ghost target, so nothing read is overwritten.
                         let slab = state.slab_mut(block, handle);
                         let mut v = grid.view_mut(block, ghost, slab);
                         for_each_box(lo, hi, |idx| {
@@ -395,7 +456,9 @@ pub fn fill_ghosts_mirror<T: Scalar, S: StorageBackend<T>, const D: usize>(
                             sidx[d] = if dir < 0 { n + idx[d] } else { idx[d] - n };
                             v.set(idx, v.get(sidx));
                         });
-                    } else {
+                    }
+                    Some(nb) => {
+                        // Interior or periodic exchange: copy neighbor interior.
                         let (dst, src) = state.slab_pair_mut(block, nb, handle);
                         let mut vd = grid.view_mut(block, ghost, dst);
                         let vs = grid.view(nb, ghost, src);
@@ -405,20 +468,18 @@ pub fn fill_ghosts_mirror<T: Scalar, S: StorageBackend<T>, const D: usize>(
                             vd.set(idx, vs.get(sidx));
                         });
                     }
-                } else {
-                    // Physical boundary: mirror across the face,
-                    // ghost -1-k ← interior k (and n+k ← n-1-k).
-                    let slab = state.slab_mut(block, handle);
-                    let mut v = grid.view_mut(block, ghost, slab);
-                    for_each_box(lo, hi, |idx| {
-                        let mut sidx = idx;
-                        sidx[d] = if dir < 0 {
-                            -1 - idx[d]
-                        } else {
-                            2 * n - 1 - idx[d]
-                        };
-                        v.set(idx, v.get(sidx));
-                    });
+                    None => {
+                        // Physical boundary: reflect to the interior mirror,
+                        // then apply the boundary condition.
+                        let slab = state.slab_mut(block, handle);
+                        let mut v = grid.view_mut(block, ghost, slab);
+                        for_each_box(lo, hi, |idx| {
+                            let mut sidx = idx;
+                            sidx[d] = reflect_coord(idx[d] as i64, 0, n as i64) as isize;
+                            let steps = reflect_steps(idx[d] as i64, 0, n as i64);
+                            v.set(idx, physical(v.get(sidx), d, dir, steps, h));
+                        });
+                    }
                 }
             }
         }

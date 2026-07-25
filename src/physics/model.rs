@@ -94,8 +94,9 @@ pub trait Model<G: Grid, D>: Send + Sync {
     /// physical boundary conditions. Called by the integrator before each
     /// evaluation sweep with the evaluation time `t` (stage time for
     /// multi-stage schemes), so time-dependent boundary forcing is
-    /// expressible. Models typically forward to a grid-family helper per
-    /// field (e.g. `fill_ghosts_mirror(grid, state, self.phi)`).
+    /// expressible. Models forward to a grid-family helper per field — a fixed
+    /// condition with `fill_ghosts_mirror`, or a per-face rule with
+    /// `fill_ghosts_bc(grid, state, self.phi, |dim, side| …)`.
     fn fill_ghosts<S: StorageBackend<Self::Scalar>>(
         &self,
         _grid: &G,

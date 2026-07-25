@@ -37,7 +37,10 @@ use crate::{
         state::{FieldHandle, State},
         storage::{Real, StorageBackend},
     },
-    geometry::grid::{BlockId, Grid},
+    geometry::{
+        boundary::reflect_coord,
+        grid::{BlockId, Grid},
+    },
 };
 
 /// Visit every cell of `bx`, dimension 0 fastest.
@@ -85,15 +88,7 @@ fn for_each_ring_cell<const D: usize>(bx: &CellBox<D>, g: i64, mut f: impl FnMut
 /// Reflect a cell coordinate across the physical (no-flux) domain
 /// boundary; interior coordinates pass through unchanged.
 fn mirror<const D: usize>(cell: [i64; D], domain: &CellBox<D>) -> [i64; D] {
-    std::array::from_fn(|d| {
-        if cell[d] < domain.lo[d] {
-            2 * domain.lo[d] - 1 - cell[d]
-        } else if cell[d] >= domain.hi[d] {
-            2 * domain.hi[d] - 1 - cell[d]
-        } else {
-            cell[d]
-        }
-    })
+    std::array::from_fn(|d| reflect_coord(cell[d], domain.lo[d], domain.hi[d]))
 }
 
 /// Inject fine solutions onto the coarse cells beneath them: each covered
@@ -340,11 +335,7 @@ fn prolong_corners<const D: usize>(
             continue;
         }
         for (d, c) in cc.iter_mut().enumerate() {
-            if *c < coarse_domain.lo[d] {
-                *c = 2 * coarse_domain.lo[d] - 1 - *c;
-            } else if *c >= coarse_domain.hi[d] {
-                *c = 2 * coarse_domain.hi[d] - 1 - *c;
-            }
+            *c = reflect_coord(*c, coarse_domain.lo[d], coarse_domain.hi[d]);
         }
         let qb = grid
             .find_patch(level - 1, cc)
@@ -384,15 +375,7 @@ fn fill_one_level<T: Real, S: StorageBackend<T>, const D: usize>(
         scratch.clear();
         for_each_ring_cell(&p.bx, i64::from(ghost), |cell| {
             // Physical mirror: reflect out-of-domain coordinates.
-            let target: [i64; D] = std::array::from_fn(|d| {
-                if cell[d] < domain.lo[d] {
-                    2 * domain.lo[d] - 1 - cell[d]
-                } else if cell[d] >= domain.hi[d] {
-                    2 * domain.hi[d] - 1 - cell[d]
-                } else {
-                    cell[d]
-                }
-            });
+            let target = mirror(cell, &domain);
             let value = grid.find_patch(level, target).map_or_else(
                 || {
                     debug_assert!(level > 0, "level 0 tiles the domain");
@@ -463,11 +446,7 @@ fn prolonged<T: Real, S: StorageBackend<T>, const D: usize>(
         // Mirror corners that fall outside the physical domain, matching
         // the no-flux boundary rule.
         for (d, c) in cc.iter_mut().enumerate() {
-            if *c < coarse_domain.lo[d] {
-                *c = 2 * coarse_domain.lo[d] - 1 - *c;
-            } else if *c >= coarse_domain.hi[d] {
-                *c = 2 * coarse_domain.hi[d] - 1 - *c;
-            }
+            *c = reflect_coord(*c, coarse_domain.lo[d], coarse_domain.hi[d]);
         }
         let qb = grid
             .find_patch(level - 1, cc)
