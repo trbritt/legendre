@@ -6,7 +6,7 @@ use crate::{
         storage::{Real, StorageBackend},
     },
     geometry::grid::Grid,
-    integrators::{Integrator, StageKind, StageLayout, eval_drift},
+    integrators::{Integrator, StageKind, StageLayout, StepCtx},
     physics::model::{Driver, Model, NoNoise},
 };
 
@@ -41,8 +41,15 @@ impl<G: Grid, D: Sync> Integrator<G, D, NoNoise> for ForwardEuler {
         S: StorageBackend<M::Scalar>,
         Sch: Scheduler,
     {
+        let ctx = StepCtx {
+            model,
+            grid,
+            disc,
+            scheduler,
+            pool,
+        };
         let k = &mut stages[0];
-        eval_drift(model, grid, disc, scheduler, pool, state, k, t);
+        ctx.eval_drift(state, k, t);
         state.axpy_with(scheduler, M::Scalar::from_f64(dt), k);
     }
 }

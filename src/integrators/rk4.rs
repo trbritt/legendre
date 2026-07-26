@@ -6,7 +6,7 @@ use crate::{
         storage::{Real, StorageBackend},
     },
     geometry::grid::Grid,
-    integrators::{Integrator, StageKind, StageLayout, eval_drift},
+    integrators::{Integrator, StageKind, StageLayout, StepCtx},
     physics::model::{Driver, Model, NoNoise},
 };
 
@@ -43,6 +43,13 @@ impl<G: Grid, D: Sync> Integrator<G, D, NoNoise> for RungeKutta4 {
         S: StorageBackend<M::Scalar>,
         Sch: Scheduler,
     {
+        let ctx = StepCtx {
+            model,
+            grid,
+            disc,
+            scheduler,
+            pool,
+        };
         let half_dt = M::Scalar::from_f64(0.5 * dt);
         let (k1, rest) = stages.split_first_mut().expect("stage buffers");
         let (k2, rest) = rest.split_first_mut().expect("stage buffers");
@@ -50,37 +57,19 @@ impl<G: Grid, D: Sync> Integrator<G, D, NoNoise> for RungeKutta4 {
         let (k4, rest) = rest.split_first_mut().expect("stage buffers");
         let y_tmp = &mut rest[0];
 
-        eval_drift(model, grid, disc, scheduler, pool, state, k1, t);
+        ctx.eval_drift(state, k1, t);
 
         y_tmp.copy_from_with(scheduler, state);
         y_tmp.axpy_with(scheduler, half_dt, k1);
-        eval_drift(
-            model,
-            grid,
-            disc,
-            scheduler,
-            pool,
-            y_tmp,
-            k2,
-            0.5f64.mul_add(dt, t),
-        );
+        ctx.eval_drift(y_tmp, k2, 0.5f64.mul_add(dt, t));
 
         y_tmp.copy_from_with(scheduler, state);
         y_tmp.axpy_with(scheduler, half_dt, k2);
-        eval_drift(
-            model,
-            grid,
-            disc,
-            scheduler,
-            pool,
-            y_tmp,
-            k3,
-            0.5f64.mul_add(dt, t),
-        );
+        ctx.eval_drift(y_tmp, k3, 0.5f64.mul_add(dt, t));
 
         y_tmp.copy_from_with(scheduler, state);
         y_tmp.axpy_with(scheduler, M::Scalar::from_f64(dt), k3);
-        eval_drift(model, grid, disc, scheduler, pool, y_tmp, k4, t + dt);
+        ctx.eval_drift(y_tmp, k4, t + dt);
 
         let sixth = M::Scalar::from_f64(dt / 6.0);
         let third = M::Scalar::from_f64(dt / 3.0);

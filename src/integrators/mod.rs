@@ -112,224 +112,172 @@ pub trait Integrator<G: Grid, D, N: DriverSet>: Send + Sync {
         Sch: Scheduler;
 }
 
-/// Dispatch one driver's vector field into `out`. If `level` is `Some`,
-/// only blocks at that refinement level are evaluated (the rest are left
-/// untouched) — the primitive Berger–Oliger subcycling steps one level at
-/// a time on; `None` evaluates every block, the global-dt path.
-#[allow(clippy::too_many_arguments)]
-fn dispatch_driver<G, D, M, S, Sch>(
-    model: &M,
-    grid: &G,
-    disc: &D,
-    scheduler: &Sch,
-    pool: &ScratchPool<M::Scalar, S>,
-    state: &State<M::Scalar, S>,
-    out: &mut State<M::Scalar, S>,
-    t: f64,
-    driver: Driver,
-    level: Option<u8>,
-) where
+/// The invariant handles of one integrator step: the components threaded
+/// unchanged through every dispatch — and, under subcycling, through every
+/// level of the recursion. Bundling them is what keeps the per-stage
+/// helpers to three or four arguments (state, output, time) instead of the
+/// eight-to-twelve they would otherwise carry; the varying pieces stay
+/// explicit arguments.
+pub(crate) struct StepCtx<'a, G, D, M, S, Sch>
+where
     G: Grid,
     M: Model<G, D>,
     S: StorageBackend<M::Scalar>,
     Sch: Scheduler,
-    D: Sync,
 {
-    let (layout, blocks) = out.split_blocks_mut();
-    scheduler.for_each_block_mut(
-        blocks,
-        || pool.checkout(),
-        |block, storage, sc| {
-            if level.is_some_and(|l| grid.level(block) != l) {
-                return;
-            }
-            let ctx = RhsContext {
-                grid,
-                disc,
-                block,
-                t,
-            };
-            model.vector_field_block(driver, &ctx, state, &mut storage.bind_mut(layout), &mut *sc);
-        },
-    );
+    /// The model being integrated.
+    pub model: &'a M,
+    /// The grid the simulation runs on.
+    pub grid: &'a G,
+    /// The discretization policy.
+    pub disc: &'a D,
+    /// The block scheduler.
+    pub scheduler: &'a Sch,
+    /// The worker-pinned scratch pool.
+    pub pool: &'a ScratchPool<M::Scalar, S>,
 }
 
-/// Fill ghosts of `state`, then evaluate the time (drift) field into `out`,
-/// both dispatched per block. The building block shared by all explicit
-/// schemes.
-#[allow(clippy::too_many_arguments)]
-fn eval_drift<G, D, M, S, Sch>(
-    model: &M,
-    grid: &G,
-    disc: &D,
-    scheduler: &Sch,
-    pool: &ScratchPool<M::Scalar, S>,
-    state: &mut State<M::Scalar, S>,
-    out: &mut State<M::Scalar, S>,
-    t: f64,
-) where
+impl<G, D, M, S, Sch> StepCtx<'_, G, D, M, S, Sch>
+where
     G: Grid,
     M: Model<G, D>,
     S: StorageBackend<M::Scalar>,
     Sch: Scheduler,
     D: Sync,
 {
-    // Halo exchange + physical boundary conditions, model-directed.
-    // This is the point at which we have global and internally consistent
-    // state for the current time at which we could evaluate nonlocal terms
-    // like convolutions, spectral range couplings, etc.
-    model.fill_ghosts(grid, state, t);
-    dispatch_driver(
-        model,
-        grid,
-        disc,
-        scheduler,
-        pool,
-        state,
-        out,
-        t,
-        Driver::Time,
-        None,
-    );
-}
+    /// Dispatch one driver's vector field into `out`. If `level` is `Some`,
+    /// only blocks at that refinement level are evaluated (the rest are left
+    /// untouched) — the primitive Berger–Oliger subcycling steps one level
+    /// at a time on; `None` evaluates every block, the global-dt path.
+    fn dispatch_driver(
+        &self,
+        state: &State<M::Scalar, S>,
+        out: &mut State<M::Scalar, S>,
+        t: f64,
+        driver: Driver,
+        level: Option<u8>,
+    ) {
+        let (model, grid, disc, pool) = (self.model, self.grid, self.disc, self.pool);
+        let (layout, blocks) = out.split_blocks_mut();
+        self.scheduler.for_each_block_mut(
+            blocks,
+            || pool.checkout(),
+            |block, storage, sc| {
+                if level.is_some_and(|l| grid.level(block) != l) {
+                    return;
+                }
+                let ctx = RhsContext {
+                    grid,
+                    disc,
+                    block,
+                    t,
+                };
+                model.vector_field_block(
+                    driver,
+                    &ctx,
+                    state,
+                    &mut storage.bind_mut(layout),
+                    &mut *sc,
+                );
+            },
+        );
+    }
 
-/// Evaluate the drift on **one level's** blocks into `out`, reading the
-/// already-ghost-filled `state`. Unlike [`eval_drift`] this does *not*
-/// fill ghosts — under subcycling the driver fills them separately, with
-/// time interpolation from the coarser level. The Berger–Oliger per-level
-/// RHS evaluation.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn eval_drift_level<G, D, M, S, Sch>(
-    model: &M,
-    grid: &G,
-    disc: &D,
-    scheduler: &Sch,
-    pool: &ScratchPool<M::Scalar, S>,
-    state: &State<M::Scalar, S>,
-    out: &mut State<M::Scalar, S>,
-    t: f64,
-    level: u8,
-) where
-    G: Grid,
-    M: Model<G, D>,
-    S: StorageBackend<M::Scalar>,
-    Sch: Scheduler,
-    D: Sync,
-{
-    dispatch_driver(
-        model,
-        grid,
-        disc,
-        scheduler,
-        pool,
-        state,
-        out,
-        t,
-        Driver::Time,
-        Some(level),
-    );
-}
+    /// Fill ghosts of `state`, then evaluate the time (drift) field into
+    /// `out`, both dispatched per block. The building block shared by all
+    /// explicit schemes.
+    ///
+    /// The ghost fill is the point at which state is global and internally
+    /// consistent for the current time — where a nonlocal term
+    /// (convolution, spectral coupling, …) would be evaluated.
+    pub(crate) fn eval_drift(
+        &self,
+        state: &mut State<M::Scalar, S>,
+        out: &mut State<M::Scalar, S>,
+        t: f64,
+    ) {
+        self.model.fill_ghosts(self.grid, state, t);
+        self.dispatch_driver(state, out, t, Driver::Time, None);
+    }
 
-/// [`eval_tendency`] restricted to one level's blocks.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn eval_tendency_level<G, D, M, S, Sch>(
-    model: &M,
-    grid: &G,
-    disc: &D,
-    scheduler: &Sch,
-    pool: &ScratchPool<M::Scalar, S>,
-    state: &State<M::Scalar, S>,
-    amp: &mut State<M::Scalar, S>,
-    t: f64,
-    driver: Driver,
-    level: u8,
-) where
-    G: Grid,
-    M: Model<G, D>,
-    S: StorageBackend<M::Scalar>,
-    Sch: Scheduler,
-    D: Sync,
-{
-    eval_tendency_impl(
-        model,
-        grid,
-        disc,
-        scheduler,
-        pool,
-        state,
-        amp,
-        t,
-        driver,
-        Some(level),
-    );
-}
+    /// Evaluate the drift on **one level's** blocks into `out`, reading the
+    /// already-ghost-filled `state`. Unlike [`Self::eval_drift`] this does
+    /// *not* fill ghosts — under subcycling the driver fills them
+    /// separately, with time interpolation from the coarser level. The
+    /// Berger–Oliger per-level RHS evaluation.
+    pub(crate) fn eval_drift_level(
+        &self,
+        state: &State<M::Scalar, S>,
+        out: &mut State<M::Scalar, S>,
+        t: f64,
+        level: u8,
+    ) {
+        self.dispatch_driver(state, out, t, Driver::Time, Some(level));
+    }
 
-/// Zero `amp` and let the model write `driver`'s amplitude field into it,
-/// reading `state` — which must be the pre-update, ghost-filled state
-/// (Itô: [`eval_drift`] has already run at the same `t`). `amp` carries
-/// storage only for the fields `driver` moves, so the zero pass and the
-/// evaluation touch exactly that memory.
-#[allow(clippy::too_many_arguments)]
-fn eval_tendency<G, D, M, S, Sch>(
-    model: &M,
-    grid: &G,
-    disc: &D,
-    scheduler: &Sch,
-    pool: &ScratchPool<M::Scalar, S>,
-    state: &State<M::Scalar, S>,
-    amp: &mut State<M::Scalar, S>,
-    t: f64,
-    driver: Driver,
-) where
-    G: Grid,
-    M: Model<G, D>,
-    S: StorageBackend<M::Scalar>,
-    Sch: Scheduler,
-    D: Sync,
-{
-    eval_tendency_impl(
-        model, grid, disc, scheduler, pool, state, amp, t, driver, None,
-    );
-}
+    /// Zero `amp` and let the model write `driver`'s amplitude field into
+    /// it, reading `state` — which must be the pre-update, ghost-filled
+    /// state (Itô: [`Self::eval_drift`] has already run at the same `t`).
+    /// `amp` carries storage only for the fields `driver` moves, so the
+    /// zero pass and the evaluation touch exactly that memory.
+    pub(crate) fn eval_tendency(
+        &self,
+        state: &State<M::Scalar, S>,
+        amp: &mut State<M::Scalar, S>,
+        t: f64,
+        driver: Driver,
+    ) {
+        self.eval_tendency_impl(state, amp, t, driver, None);
+    }
 
-#[allow(clippy::too_many_arguments)]
-fn eval_tendency_impl<G, D, M, S, Sch>(
-    model: &M,
-    grid: &G,
-    disc: &D,
-    scheduler: &Sch,
-    pool: &ScratchPool<M::Scalar, S>,
-    state: &State<M::Scalar, S>,
-    amp: &mut State<M::Scalar, S>,
-    t: f64,
-    driver: Driver,
-    level: Option<u8>,
-) where
-    G: Grid,
-    M: Model<G, D>,
-    S: StorageBackend<M::Scalar>,
-    Sch: Scheduler,
-    D: Sync,
-{
-    // Zeroing is fused into the evaluation dispatch: each work item resets
-    // its own block's slabs just before the model fills them, so the
-    // buffer is touched once (cache-hot), with one barrier instead of two.
-    let (layout, blocks) = amp.split_blocks_mut();
-    scheduler.for_each_block_mut(
-        blocks,
-        || pool.checkout(),
-        |block, storage, sc| {
-            if level.is_some_and(|l| grid.level(block) != l) {
-                return;
-            }
-            storage.fill_zero();
-            let ctx = RhsContext {
-                grid,
-                disc,
-                block,
-                t,
-            };
-            model.vector_field_block(driver, &ctx, state, &mut storage.bind_mut(layout), &mut *sc);
-        },
-    );
+    /// [`Self::eval_tendency`] restricted to one level's blocks.
+    pub(crate) fn eval_tendency_level(
+        &self,
+        state: &State<M::Scalar, S>,
+        amp: &mut State<M::Scalar, S>,
+        t: f64,
+        driver: Driver,
+        level: u8,
+    ) {
+        self.eval_tendency_impl(state, amp, t, driver, Some(level));
+    }
+
+    fn eval_tendency_impl(
+        &self,
+        state: &State<M::Scalar, S>,
+        amp: &mut State<M::Scalar, S>,
+        t: f64,
+        driver: Driver,
+        level: Option<u8>,
+    ) {
+        let (model, grid, disc, pool) = (self.model, self.grid, self.disc, self.pool);
+        // Zeroing is fused into the evaluation dispatch: each work item
+        // resets its own block's slabs just before the model fills them, so
+        // the buffer is touched once (cache-hot), with one barrier instead
+        // of two.
+        let (layout, blocks) = amp.split_blocks_mut();
+        self.scheduler.for_each_block_mut(
+            blocks,
+            || pool.checkout(),
+            |block, storage, sc| {
+                if level.is_some_and(|l| grid.level(block) != l) {
+                    return;
+                }
+                storage.fill_zero();
+                let ctx = RhsContext {
+                    grid,
+                    disc,
+                    block,
+                    t,
+                };
+                model.vector_field_block(
+                    driver,
+                    &ctx,
+                    state,
+                    &mut storage.bind_mut(layout),
+                    &mut *sc,
+                );
+            },
+        );
+    }
 }

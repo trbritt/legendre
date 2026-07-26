@@ -39,7 +39,7 @@ use crate::{
         state::State, storage::StorageBackend,
     },
     geometry::amr::{self, AmrGrid},
-    integrators::{Integrator, StageKind, StageLayout, eval_drift_level, eval_tendency_level},
+    integrators::{Integrator, StageKind, StageLayout, StepCtx},
     physics::model::{DriverSet, Model},
 };
 
@@ -124,129 +124,145 @@ impl<D2: Sync, N: DriverSet, const D: usize> Integrator<AmrGrid<D>, D2, N> for S
             })
             .collect();
 
-        advance(
-            self.seed,
-            model,
-            grid,
-            disc,
-            scheduler,
-            pool,
-            state,
-            drift,
-            amps,
-            snapshots,
-            &field_plan,
-            &plans,
-            0,
-            t,
-            dt,
-            0.0,
-        );
-    }
-}
-
-/// Advance level `level` by `dt`, starting at time `t`; `alpha` is the
-/// fraction of the *parent's* step already elapsed at `t`, used to
-/// interpolate this level's coarse ghost source in time. Recurses into
-/// finer levels (subcycling them) and restricts them back on completion.
-#[allow(clippy::too_many_arguments)]
-fn advance<M, S, Sch, D2, const D: usize, N>(
-    seed: u64,
-    model: &M,
-    grid: &AmrGrid<D>,
-    disc: &D2,
-    scheduler: &Sch,
-    pool: &ScratchPool<M::Scalar, S>,
-    state: &mut State<M::Scalar, S>,
-    drift: &mut State<M::Scalar, S>,
-    amps: &mut [State<M::Scalar, S>],
-    snapshots: &mut [State<M::Scalar, S>],
-    field_plan: &[(FieldHandle<M::Scalar>, usize)],
-    plans: &[amr::FillPlan<D>],
-    level: u8,
-    t: f64,
-    dt: f64,
-    alpha: f64,
-) where
-    M: Model<AmrGrid<D>, D2, Drivers = N>,
-    S: StorageBackend<M::Scalar>,
-    Sch: Scheduler,
-    D2: Sync,
-    N: DriverSet,
-{
-    let l = level as usize;
-
-    // 1. Snapshot this level's pre-step state — the coarse source our
-    //    children interpolate from in time.
-    snapshots[l].copy_from_with(scheduler, state);
-
-    // 2. Fill this level's ghosts. Level 0 has no coarser parent; finer
-    //    levels interpolate their prolongation source between the parent
-    //    snapshot (at α) and the parent's post-step state.
-    for &(h, pi) in field_plan {
-        let interp = (level > 0).then(|| (&snapshots[l - 1] as &State<M::Scalar, S>, alpha));
-        amr::fill_level(grid, state, interp, h, level, &plans[pi]);
-    }
-
-    // 3. Step this level by dt (Euler–Maruyama, restricted to its blocks).
-    let salt = t.to_bits();
-    eval_drift_level(model, grid, disc, scheduler, pool, state, drift, t, level);
-    for (i, amp) in amps.iter_mut().enumerate() {
-        eval_tendency_level(
-            model,
-            grid,
-            disc,
-            scheduler,
-            pool,
-            state,
-            amp,
-            t,
-            N::driver(i),
-            level,
-        );
-    }
-    state.apply_step_level::<AmrGrid<D>, N, Sch>(
-        scheduler, grid, drift, amps, dt, seed, salt, level,
-    );
-
-    // 4. Subcycle the next finer level, if present. The substep count is
-    //    the ratio of the model's stability limits at the two spacings —
-    //    r² for a parabolic model, r for hyperbolic, derived not assumed.
-    let child = level + 1;
-    if (child as usize) < grid.num_levels() {
-        let dt_coarse = model
-            .stable_dt(grid.spacing_at_level(level))
-            .expect("subcycling requires Model::stable_dt");
-        let dt_fine = model
-            .stable_dt(grid.spacing_at_level(child))
-            .expect("subcycling requires Model::stable_dt");
-        let n = (dt_coarse / dt_fine).round().max(1.0) as u64;
-        let dt_child = dt / n as f64;
-        for s in 0..n {
-            let child_t = (s as f64).mul_add(dt_child, t);
-            let child_alpha = s as f64 / n as f64;
-            advance(
-                seed,
+        let sub = Subcycle {
+            ctx: StepCtx {
                 model,
                 grid,
                 disc,
                 scheduler,
                 pool,
-                state,
-                drift,
-                amps,
-                snapshots,
-                field_plan,
-                plans,
-                child,
-                child_t,
-                dt_child,
-                child_alpha,
-            );
+            },
+            seed: self.seed,
+            field_plan: &field_plan,
+            plans: &plans,
+        };
+        sub.advance(
+            state,
+            drift,
+            amps,
+            snapshots,
+            Substep {
+                level: 0,
+                t,
+                dt,
+                alpha: 0.0,
+            },
+        );
+    }
+}
+
+/// One node of the Berger–Oliger recursion: which level to advance, from
+/// what time, by how much, and how far into the parent's step it starts.
+/// `alpha` is the fraction of the *parent's* step already elapsed at `t`,
+/// used to interpolate this level's coarse ghost source in time.
+#[derive(Debug, Clone, Copy)]
+struct Substep {
+    level: u8,
+    t: f64,
+    dt: f64,
+    alpha: f64,
+}
+
+/// The invariants of one whole coarse step: the shared integrator context
+/// plus the noise seed and the ghost-fill plans, all fixed across every
+/// level of the recursion. Bundling them turns the recursive [`advance`]
+/// into a five-argument method.
+///
+/// [`advance`]: Subcycle::advance
+struct Subcycle<'a, D2, M, S, Sch, const D: usize>
+where
+    M: Model<AmrGrid<D>, D2>,
+    S: StorageBackend<M::Scalar>,
+    Sch: Scheduler,
+    D2: Sync,
+{
+    ctx: StepCtx<'a, AmrGrid<D>, D2, M, S, Sch>,
+    seed: u64,
+    field_plan: &'a [(FieldHandle<M::Scalar>, usize)],
+    plans: &'a [amr::FillPlan<D>],
+}
+
+impl<D2, M, S, Sch, const D: usize> Subcycle<'_, D2, M, S, Sch, D>
+where
+    M: Model<AmrGrid<D>, D2>,
+    S: StorageBackend<M::Scalar>,
+    Sch: Scheduler,
+    D2: Sync,
+{
+    /// Advance one recursion node: snapshot, ghost-fill, step this level,
+    /// then subcycle and restrict the next finer level. Recurses into finer
+    /// levels (subcycling them) and restricts them back on completion.
+    fn advance(
+        &self,
+        state: &mut State<M::Scalar, S>,
+        drift: &mut State<M::Scalar, S>,
+        amps: &mut [State<M::Scalar, S>],
+        snapshots: &mut [State<M::Scalar, S>],
+        sub: Substep,
+    ) {
+        let Substep {
+            level,
+            t,
+            dt,
+            alpha,
+        } = sub;
+        let (grid, model, scheduler) = (self.ctx.grid, self.ctx.model, self.ctx.scheduler);
+        let l = level as usize;
+
+        // 1. Snapshot this level's pre-step state — the coarse source our
+        //    children interpolate from in time.
+        snapshots[l].copy_from_with(scheduler, state);
+
+        // 2. Fill this level's ghosts. Level 0 has no coarser parent; finer
+        //    levels interpolate their prolongation source between the parent
+        //    snapshot (at α) and the parent's post-step state.
+        for &(h, pi) in self.field_plan {
+            let interp = (level > 0).then(|| (&snapshots[l - 1] as &State<M::Scalar, S>, alpha));
+            amr::fill_level(grid, state, interp, h, level, &self.plans[pi]);
         }
-        // 5. Fine solution wins beneath the patch.
-        for &(h, _) in field_plan {
-            amr::restrict_level(grid, state, h, child);
+
+        // 3. Step this level by dt (Euler–Maruyama, restricted to its blocks).
+        let salt = t.to_bits();
+        self.ctx.eval_drift_level(state, drift, t, level);
+        for (i, amp) in amps.iter_mut().enumerate() {
+            self.ctx
+                .eval_tendency_level(state, amp, t, M::Drivers::driver(i), level);
+        }
+        state.apply_step_level::<AmrGrid<D>, M::Drivers, Sch>(
+            scheduler, grid, drift, amps, dt, self.seed, salt, level,
+        );
+
+        // 4. Subcycle the next finer level, if present. The substep count is
+        //    the ratio of the model's stability limits at the two spacings —
+        //    r² for a parabolic model, r for hyperbolic, derived not assumed.
+        let child = level + 1;
+        if (child as usize) < grid.num_levels() {
+            let dt_coarse = model
+                .stable_dt(grid.spacing_at_level(level))
+                .expect("subcycling requires Model::stable_dt");
+            let dt_fine = model
+                .stable_dt(grid.spacing_at_level(child))
+                .expect("subcycling requires Model::stable_dt");
+            let n = (dt_coarse / dt_fine).round().max(1.0) as u64;
+            let dt_child = dt / n as f64;
+            for s in 0..n {
+                self.advance(
+                    state,
+                    drift,
+                    amps,
+                    snapshots,
+                    Substep {
+                        level: child,
+                        t: (s as f64).mul_add(dt_child, t),
+                        dt: dt_child,
+                        alpha: s as f64 / n as f64,
+                    },
+                );
+            }
+            // 5. Fine solution wins beneath the patch.
+            for &(h, _) in self.field_plan {
+                amr::restrict_level(grid, state, h, child);
+            }
         }
     }
 }
