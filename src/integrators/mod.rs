@@ -114,10 +114,7 @@ pub trait Integrator<G: Grid, D, N: DriverSet>: Send + Sync {
 
 /// The invariant handles of one integrator step: the components threaded
 /// unchanged through every dispatch — and, under subcycling, through every
-/// level of the recursion. Bundling them is what keeps the per-stage
-/// helpers to three or four arguments (state, output, time) instead of the
-/// eight-to-twelve they would otherwise carry; the varying pieces stay
-/// explicit arguments.
+/// level of the recursion.
 pub(crate) struct StepCtx<'a, G, D, M, S, Sch>
 where
     G: Grid,
