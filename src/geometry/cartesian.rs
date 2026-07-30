@@ -401,10 +401,12 @@ pub fn fill_ghosts_mirror<T, S, const D: usize>(
 }
 
 /// Halo exchange plus **linear extrapolation** ([`FaceBc::Extrapolate`]) at
-/// every physical boundary — a transparent outflow condition that continues
-/// the field linearly across the face (zero second normal derivative), used
-/// where a mirror would impose a spurious no-flux wall. Requires blocks at
-/// least two cells thick in every dimension.
+/// every physical boundary.
+///
+/// A transparent outflow condition that continues the field linearly across
+/// the face (zero second normal derivative), used where a mirror would impose
+/// a spurious no-flux wall. Requires blocks at least two cells thick in every
+/// dimension.
 pub fn fill_ghosts_extrapolate<T, S, const D: usize>(
     grid: &CartesianGrid<D>,
     state: &mut State<T, S>,
@@ -504,13 +506,13 @@ fn fill_ghosts_generic<T, S, const D: usize>(
                         let slab = state.slab_mut(block, handle);
                         let mut v = grid.view_mut(block, ghost, slab);
                         for_each_box(lo, hi, |idx| {
-                            let k = (if dir < 0 { -1 - idx[d] } else { idx[d] - n }) as i64;
-                            let val = bc(d, dir).ghost_value(k, h, |j| {
+                            let layer = (if dir < 0 { -1 - idx[d] } else { idx[d] - n }) as i64;
+                            let val = bc(d, dir).ghost_value(layer, h, |inward| {
                                 let mut iidx = idx;
                                 iidx[d] = if dir < 0 {
-                                    j as isize
+                                    inward as isize
                                 } else {
-                                    n - 1 - j as isize
+                                    n - 1 - inward as isize
                                 };
                                 v.get(iidx)
                             });
