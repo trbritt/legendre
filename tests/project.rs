@@ -64,7 +64,9 @@ impl<D: Sync> Model<CartesianGrid<1>, D> for ClampedDecay {
         for b in 0..grid.num_blocks() {
             let block = BlockId(b as u32);
             let mut v = state.view_mut(grid, block, self.v.unwrap());
-            for_each_interior(grid.block_cells(), |idx| v.set(idx, v.get(idx).max(self.floor)));
+            for_each_interior(grid.block_cells(), |idx| {
+                v.set(idx, v.get(idx).max(self.floor))
+            });
         }
     }
 }
@@ -77,7 +79,14 @@ struct MinObserver {
 }
 
 impl<S: StorageBackend<f64>> Observer<CartesianGrid<1>, f64, S> for MinObserver {
-    fn observe(&mut self, _step: u64, _t: f64, _epoch: u64, grid: &CartesianGrid<1>, state: &State<f64, S>) {
+    fn observe(
+        &mut self,
+        _step: u64,
+        _t: f64,
+        _epoch: u64,
+        grid: &CartesianGrid<1>,
+        state: &State<f64, S>,
+    ) {
         let mut m = self.min.lock().unwrap();
         for b in 0..grid.num_blocks() {
             let v = state.view(grid, BlockId(b as u32), self.v);
@@ -96,7 +105,14 @@ fn run(clamp: bool, steps: usize) -> (Vec<f64>, f64) {
         clamp,
         v: None,
     };
-    let mut sim = Simulation::new(grid, (), model, ForwardEuler, SerialScheduler, SystemAllocator);
+    let mut sim = Simulation::new(
+        grid,
+        (),
+        model,
+        ForwardEuler,
+        SerialScheduler,
+        SystemAllocator,
+    );
 
     let v = sim.model().v.unwrap();
     let (g, state) = sim.state_mut();
@@ -122,7 +138,9 @@ fn run(clamp: bool, steps: usize) -> (Vec<f64>, f64) {
     let mut final_vals = Vec::new();
     for b in 0..sim.grid().num_blocks() {
         let view = sim.state().view(sim.grid(), BlockId(b as u32), v);
-        for_each_interior(sim.grid().block_cells(), |idx| final_vals.push(view.get(idx)));
+        for_each_interior(sim.grid().block_cells(), |idx| {
+            final_vals.push(view.get(idx))
+        });
     }
     let m = *observed_min.lock().unwrap();
     (final_vals, m)
@@ -153,5 +171,8 @@ fn without_project_the_constraint_is_violated() {
         final_vals.iter().all(|&v| v < 0.0),
         "unprojected decay must cross below the floor"
     );
-    assert!(observed_min < 0.0, "observers should see the unclamped excursion");
+    assert!(
+        observed_min < 0.0,
+        "observers should see the unclamped excursion"
+    );
 }

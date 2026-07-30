@@ -4,3 +4,4 @@
 pub mod market_making;
 pub mod model;
 pub mod phasefield;
+pub mod stochastic_vol;
