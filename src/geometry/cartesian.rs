@@ -19,10 +19,7 @@ use crate::{
         state::{FieldHandle, State},
         storage::{Real, Scalar, StorageBackend},
     },
-    geometry::{
-        GridError,
-        boundary::{FaceBc, reflect_coord, reflect_steps},
-    },
+    geometry::{GridError, boundary::FaceBc},
 };
 
 /// Uniform Cartesian grid of `cells` interior cells tiled by congruent
@@ -386,9 +383,7 @@ pub fn fill_ghosts_bc<T, S, const D: usize>(
     T: Real,
     S: StorageBackend<T>,
 {
-    fill_ghosts_generic(grid, state, handle, |src, dim, side, steps, h| {
-        bc(dim, side).ghost_value(src, steps, h)
-    });
+    fill_ghosts_generic(grid, state, handle, bc);
 }
 
 /// Halo exchange plus **mirror (no-flux)** physical boundaries — the common
@@ -399,20 +394,38 @@ pub fn fill_ghosts_mirror<T, S, const D: usize>(
     state: &mut State<T, S>,
     handle: FieldHandle<T>,
 ) where
-    T: Scalar,
+    T: Real,
     S: StorageBackend<T>,
 {
-    // Mirror is a pure copy of the reflected interior value, so it needs no
-    // arithmetic and stays on `Scalar` (usable for non-`Real` marker fields).
-    fill_ghosts_generic(grid, state, handle, |src, _, _, _, _| src);
+    fill_ghosts_generic(grid, state, handle, |_, _| FaceBc::Mirror);
 }
 
-/// The shared sweep skeleton behind every Cartesian ghost fill. `physical`
-/// maps a boundary ghost's mirror-image interior value `src` — with its
-/// `(dim, side)`, the odd cell distance `steps` = 2k+1 to the source, and the
-/// normal spacing `h` — to the ghost value; interior/periodic ghosts are pure
-/// exchange and never consult it. Generic over `Scalar` (the skeleton only
-/// moves values); conditions that do arithmetic pin `Real` in `physical`.
+/// Halo exchange plus **linear extrapolation** ([`FaceBc::Extrapolate`]) at
+/// every physical boundary — a transparent outflow condition that continues
+/// the field linearly across the face (zero second normal derivative), used
+/// where a mirror would impose a spurious no-flux wall. Requires blocks at
+/// least two cells thick in every dimension.
+pub fn fill_ghosts_extrapolate<T, S, const D: usize>(
+    grid: &CartesianGrid<D>,
+    state: &mut State<T, S>,
+    handle: FieldHandle<T>,
+) where
+    T: Real,
+    S: StorageBackend<T>,
+{
+    debug_assert!(
+        grid.block_cells().iter().all(|&n| n >= 2),
+        "linear extrapolation reads two interior cells per dimension"
+    );
+    fill_ghosts_bc(grid, state, handle, |_, _| FaceBc::Extrapolate);
+}
+
+/// The shared sweep skeleton behind every Cartesian ghost fill. At a physical
+/// boundary the per-face [`FaceBc`] `bc(dim, side)` continues the interior
+/// across the face, reading interior cells inward from the edge along the
+/// outward normal; interior and periodic ghosts are pure exchange and never
+/// consult it. The accessor is passed to [`FaceBc::ghost_value`] inline, so
+/// the no-flux mirror folds to a single read with no indirection.
 ///
 /// In place, dimension by dimension: each sweep `d` writes only `d`-ghost
 /// strips and reads only `d`-interior strips (plus, in the other dimensions,
@@ -425,9 +438,9 @@ fn fill_ghosts_generic<T, S, const D: usize>(
     grid: &CartesianGrid<D>,
     state: &mut State<T, S>,
     handle: FieldHandle<T>,
-    physical: impl Fn(T, usize, isize, i64, f64) -> T,
+    bc: impl Fn(usize, isize) -> FaceBc,
 ) where
-    T: Scalar,
+    T: Real,
     S: StorageBackend<T>,
 {
     let ghost = state.layout().ghost(handle.index());
@@ -485,15 +498,23 @@ fn fill_ghosts_generic<T, S, const D: usize>(
                         });
                     }
                     None => {
-                        // Physical boundary: reflect to the interior mirror,
-                        // then apply the boundary condition.
+                        // Physical boundary: continue the interior across the
+                        // face per the rule, reading interior cells inward
+                        // from the edge (j = 0) along the outward normal.
                         let slab = state.slab_mut(block, handle);
                         let mut v = grid.view_mut(block, ghost, slab);
                         for_each_box(lo, hi, |idx| {
-                            let mut sidx = idx;
-                            sidx[d] = reflect_coord(idx[d] as i64, 0, n as i64) as isize;
-                            let steps = reflect_steps(idx[d] as i64, 0, n as i64);
-                            v.set(idx, physical(v.get(sidx), d, dir, steps, h));
+                            let k = (if dir < 0 { -1 - idx[d] } else { idx[d] - n }) as i64;
+                            let val = bc(d, dir).ghost_value(k, h, |j| {
+                                let mut iidx = idx;
+                                iidx[d] = if dir < 0 {
+                                    j as isize
+                                } else {
+                                    n - 1 - j as isize
+                                };
+                                v.get(iidx)
+                            });
+                            v.set(idx, val);
                         });
                     }
                 }
