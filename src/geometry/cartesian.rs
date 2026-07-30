@@ -230,10 +230,19 @@ impl<'a, T: Scalar, const D: usize> CartesianView<'a, T, D> {
 
 impl<T: Scalar, const D: usize> CartesianView<'_, T, D> {
     /// Value at `idx` (ghost cells addressable with negative indices).
+    ///
+    /// The offset is bounds-checked by `linearize`'s `debug_assert` in debug
+    /// builds; release stencil loops (~20 loads/cell in the flux kernel) skip
+    /// the redundant slice bounds check. Sound because every read stays within
+    /// `[-ghost, interior+ghost)` — the interior loop plus the enforced
+    /// `ghost >= stencil width` keep the offset inside the slab.
     #[inline(always)]
     #[must_use]
     pub fn get(&self, idx: [isize; D]) -> T {
-        self.data[linearize(idx, self.interior, self.ghost)]
+        let off = linearize(idx, self.interior, self.ghost);
+        debug_assert!(off < self.data.len(), "view read out of slab bounds");
+        // SAFETY: `linearize` maps every in-support index into `[0, len)`.
+        unsafe { *self.data.get_unchecked(off) }
     }
 
     /// Interior extent of the block.
@@ -270,17 +279,24 @@ impl<'a, T: Scalar, const D: usize> CartesianViewMut<'a, T, D> {
 }
 
 impl<T: Scalar, const D: usize> CartesianViewMut<'_, T, D> {
-    /// Value at `idx` (ghost cells addressable with negative indices).
+    /// Value at `idx` (ghost cells addressable with negative indices). See
+    /// [`CartesianView::get`] for why the release read is unchecked.
     #[inline(always)]
     #[must_use]
     pub fn get(&self, idx: [isize; D]) -> T {
-        self.data[linearize(idx, self.interior, self.ghost)]
+        let off = linearize(idx, self.interior, self.ghost);
+        debug_assert!(off < self.data.len(), "view read out of slab bounds");
+        // SAFETY: `linearize` maps every in-support index into `[0, len)`.
+        unsafe { *self.data.get_unchecked(off) }
     }
 
     /// Write `value` at `idx`.
     #[inline(always)]
     pub fn set(&mut self, idx: [isize; D], value: T) {
-        self.data[linearize(idx, self.interior, self.ghost)] = value;
+        let off = linearize(idx, self.interior, self.ghost);
+        debug_assert!(off < self.data.len(), "view write out of slab bounds");
+        // SAFETY: `linearize` maps every in-support index into `[0, len)`.
+        unsafe { *self.data.get_unchecked_mut(off) = value };
     }
 
     /// Interior extent of the block.

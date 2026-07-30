@@ -4,7 +4,7 @@ use crate::{
         storage::StorageBackend,
     },
     geometry::grid::Grid,
-    integrators::{Integrator, StageKind, StageLayout, eval_drift, eval_tendency},
+    integrators::{Integrator, StageKind, StageLayout, StepCtx},
     physics::model::{DriverSet, Model},
 };
 
@@ -47,22 +47,19 @@ impl<G: Grid, D: Sync, N: DriverSet> Integrator<G, D, N> for EulerMaruyama {
         S: StorageBackend<M::Scalar>,
         Sch: Scheduler,
     {
+        let ctx = StepCtx {
+            model,
+            grid,
+            disc,
+            scheduler,
+            pool,
+        };
         let (k, stochastic) = stages.split_first_mut().expect("stage buffers");
         // Every field — drift and all amplitudes — is evaluated at the
         // pre-update state before any update is applied (Itô).
-        eval_drift(model, grid, disc, scheduler, pool, state, k, t);
+        ctx.eval_drift(state, k, t);
         for (i, amp) in stochastic.iter_mut().enumerate() {
-            eval_tendency(
-                model,
-                grid,
-                disc,
-                scheduler,
-                pool,
-                state,
-                amp,
-                t,
-                N::driver(i),
-            );
+            ctx.eval_tendency(state, amp, t, N::driver(i));
         }
         // Drift + every driver applied in one dispatch, block-local and
         // cache-hot (see State::apply_step_with).
