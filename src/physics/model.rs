@@ -129,6 +129,23 @@ pub trait Model<G: Grid, D>: Send + Sync {
         scratch: &mut Scratch<Self::Scalar, S>,
     );
 
+    /// Enforce pointwise state constraints after each completed step (e.g.
+    /// positivity of a CIR variance, clamping an order parameter). Called by
+    /// the simulation over the whole state between the integrator update and
+    /// observer notification — once per step, *after* the full advance, so
+    /// under subcycling it sees the synchronized state, not intermediate
+    /// substages. This is an explicit post-hoc correction, not part of any
+    /// scheme's stage combination; multi-stage intermediate states are never
+    /// projected.
+    ///
+    /// Default: no-op.
+    fn project<S: StorageBackend<Self::Scalar>>(
+        &self,
+        _grid: &G,
+        _state: &mut State<Self::Scalar, S>,
+    ) {
+    }
+
     /// Largest stable explicit timestep for a cell of the given `spacing`,
     /// if the model knows one (e.g. `0.25·h²/D` for a diffusion term).
     ///

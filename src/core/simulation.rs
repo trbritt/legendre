@@ -3,7 +3,8 @@
 //!
 //! Construction is the one place allocation happens: field registration →
 //! state build → stage buffers. `step()` then delegates: integrator drives
-//! model through scheduler; observers are notified after the state update.
+//! model through scheduler; the model projects pointwise state constraints;
+//! observers are notified after the state update.
 //!
 //! Scratch memory is a worker-pinned [`ScratchPool`] sized to the
 //! scheduler's concurrency, so nothing allocates after construction.
@@ -278,6 +279,9 @@ where
             self.t,
             dt,
         );
+        // Pointwise constraints (e.g. CIR positivity) on the synchronized
+        // post-step state, before observers see it.
+        self.model.project(&self.grid, &mut self.state);
         self.t += dt;
         self.step_index += 1;
         for obs in &mut self.observers {
