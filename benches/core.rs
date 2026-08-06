@@ -33,7 +33,7 @@ use legendre::{
     core::{
         driver::{Driver, DriverSet},
         monte_carlo::path_grid,
-        scheduler::SerialScheduler,
+        scheduler::{RayonScheduler, Scheduler, SerialScheduler},
         simulation::Simulation,
         state::{FieldHandle, State, StateBuilder},
         storage::{DenseStorage, SystemAllocator},
@@ -358,6 +358,37 @@ fn ensemble_sim(params: MarketMakerParams, tables: Arc<DepthTables>) -> Ensemble
     sim
 }
 
+/// Full backward-time HJB re-solve to the horizon (state reset to the zero
+/// terminal condition each iteration) — the policy-refresh latency itself.
+fn bench_hjb_solve<Sch: Scheduler>(
+    c: &mut Criterion,
+    name: &str,
+    scheduler: Sch,
+    cells: usize,
+    block: usize,
+) {
+    let (lo, hi) = (0.001, 2.0);
+    let grid = CartesianGrid::new([cells], [block], [lo], [(hi - lo) / cells as f64]).unwrap();
+    let mut sim = Simulation::new(
+        grid,
+        (),
+        HjbMarketMaker::new(MarketMakerParams::default()),
+        ForwardEuler,
+        scheduler,
+        SystemAllocator,
+    );
+    let dt = sim.stable_dt().unwrap();
+    let steps = (HORIZON / dt).ceil() as usize;
+    c.bench_function(name, |b| {
+        b.iter(|| {
+            sim.state_mut().1.fill_zero();
+            for _ in 0..steps {
+                sim.step(dt);
+            }
+        });
+    });
+}
+
 fn market_making(c: &mut Criterion) {
     let params = MarketMakerParams::default();
 
@@ -367,6 +398,13 @@ fn market_making(c: &mut Criterion) {
         let (mut sim, dt) = hjb_sim(params);
         b.iter(|| sim.step(dt));
     });
+
+    // Full re-solve latency: the cheap, bit-exact levers (parallelism, grid
+    // resolution) measured against the serial baseline.
+    bench_hjb_solve(c, "mm/hjb/solve/serial_n100", SerialScheduler, 100, 25);
+    bench_hjb_solve(c, "mm/hjb/solve/rayon_n100", RayonScheduler, 100, 10);
+    bench_hjb_solve(c, "mm/hjb/solve/serial_n50", SerialScheduler, 50, 25);
+    bench_hjb_solve(c, "mm/hjb/solve/serial_n200", SerialScheduler, 200, 25);
 
     // Backtest throughput: one Euler–Maruyama step of the controlled ensemble.
     c.bench_function("mm/ensemble/step", |b| {
