@@ -57,16 +57,18 @@
 
 use crate::{
     core::{
+        driver::WienerJump,
         scratch::Scratch,
         state::{BlockStateMut, FieldHandle, State, StateBuilder},
         storage::StorageBackend,
     },
     geometry::{
         cartesian::{CartesianGrid, fill_ghosts_extrapolate, for_each_interior},
-        grid::Grid,
+        grid::{BlockId, Grid},
     },
     physics::model::{Driver, Model, NoNoise, RhsContext},
 };
+use std::sync::Arc;
 
 /// Intensity parameters of one quoting side.
 #[derive(Debug, Clone, Copy)]
@@ -361,5 +363,315 @@ impl<D: Sync> Model<CartesianGrid<1>, D> for HjbMarketMaker {
             .max(bound(p.nu_max))
             .max(bound(p.theta.clamp(p.nu_min, p.nu_max)));
         (worst > 0.0).then(|| 0.8 / worst)
+    }
+}
+
+/// Optimal quoted depths δᵇ/δˢ on the `(τ, ν, q)` lattice, with nearest-node
+/// lookup — the interface between the [`HjbMarketMaker`] solve and the
+/// controlled path ensemble ([`MarketMakingEnsemble`]).
+///
+/// Built from the recorded HJB value surface: for each recorded backward-time
+/// frame it bakes [`HjbMarketMaker::optimal_depths`] into `bid`/`ask` tables
+/// indexed `[frame][q_index·n_ν + ν_cell]`, with `f64::INFINITY` marking a
+/// withdrawn side. Cheap, allocation-free reads during the path simulation.
+#[derive(Debug, Clone)]
+pub struct DepthTables {
+    dtau: f64,
+    nu_min: f64,
+    dnu: f64,
+    n_nu: usize,
+    q_min: isize,
+    q_max: isize,
+    bid: Vec<Vec<f64>>,
+    ask: Vec<Vec<f64>>,
+}
+
+impl DepthTables {
+    /// Bake the depth tables from the recorded value surface. `taus` are the
+    /// recorded backward-time levels (uniformly spaced, ascending from 0), and
+    /// `surfaces[frame][q_index][ν_cell]` is the value `u` at each — exactly
+    /// what a surface-recording observer accumulates over the HJB solve.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a surface frame is not `num_levels × grid.cells()` shaped.
+    #[must_use]
+    pub fn build(
+        model: &HjbMarketMaker,
+        grid: &CartesianGrid<1>,
+        taus: &[f64],
+        surfaces: &[Vec<Vec<f64>>],
+    ) -> Self {
+        let p = &model.params;
+        let n_nu = grid.cells()[0];
+        let nq = p.num_levels();
+        let dtau = if taus.len() > 1 {
+            taus[1] - taus[0]
+        } else {
+            f64::MAX
+        };
+
+        let (mut bid, mut ask) = (Vec::with_capacity(surfaces.len()), Vec::with_capacity(surfaces.len()));
+        for surface in surfaces {
+            let mut b = vec![0.0; nq * n_nu];
+            let mut a = vec![0.0; nq * n_nu];
+            for qi in 0..nq {
+                let q = p.q_min + qi as isize;
+                for cell in 0..n_nu {
+                    let u_q = surface[qi][cell];
+                    let u_up = (q < p.q_max).then(|| surface[qi + 1][cell]);
+                    let u_dn = (q > p.q_min).then(|| surface[qi - 1][cell]);
+                    let (db, da) = model.optimal_depths(q, u_q, u_up, u_dn);
+                    b[qi * n_nu + cell] = db;
+                    a[qi * n_nu + cell] = da;
+                }
+            }
+            bid.push(b);
+            ask.push(a);
+        }
+
+        // Cell centers sit at nu_min + (i + 0.5)·dν; recover the domain edge.
+        let dnu = grid.spacing(BlockId(0))[0];
+        let nu_min = 0.5f64.mul_add(-dnu, grid.cell_center(BlockId(0), [0])[0]);
+        Self {
+            dtau,
+            nu_min,
+            dnu,
+            n_nu,
+            q_min: p.q_min,
+            q_max: p.q_max,
+            bid,
+            ask,
+        }
+    }
+
+    /// `(δᵇ, δˢ)` at remaining horizon `tau`, variance `nu`, inventory `q`
+    /// (nearest lattice node, clamped into range). A withdrawn side reads
+    /// `f64::INFINITY`.
+    #[must_use]
+    pub fn lookup(&self, tau: f64, nu: f64, q: isize) -> (f64, f64) {
+        let t = ((tau / self.dtau).round().max(0.0) as usize).min(self.bid.len() - 1);
+        let cell =
+            (((nu - self.nu_min) / self.dnu - 0.5).round().max(0.0) as usize).min(self.n_nu - 1);
+        let qi = (q.clamp(self.q_min, self.q_max) - self.q_min) as usize;
+        let at = qi * self.n_nu + cell;
+        (self.bid[t][at], self.ask[t][at])
+    }
+}
+
+/// The **controlled** market-making system as a Monte Carlo path ensemble —
+/// one path per grid cell (a 0-dimensional SDE per cell; see
+/// [`crate::physics::stochastic_vol`]). Pairs with the
+/// [`crate::core::monte_carlo`] harness.
+///
+/// Per path: a CIR variance and diffusive midprice (as in
+/// [`crate::physics::stochastic_vol::StochVolPaths`]) driven by two Wiener
+/// processes, plus two jump channels — bid and ask fills — that fire at the
+/// optimal quotes looked up from a [`DepthTables`]. A bid fill (rate
+/// `λᵇ·e^{−κᵇδᵇ}`) does `q += 1`, `cash −= S − δᵇ`; an ask fill does `q −= 1`,
+/// `cash += S + δˢ`. Withdrawn sides read an infinite depth, hence zero
+/// intensity, so inventory stays in `[q_min, q_max]` with no explicit clamp.
+///
+/// Driver set [`WienerJump<2, 2>`]: `nu`←Wiener 0, `mid`←Wiener 1, bid←Jump 0,
+/// ask←Jump 1.
+#[derive(Debug, Clone)]
+pub struct MarketMakingEnsemble {
+    /// Model parameters (shared with the HJB solve).
+    pub params: MarketMakerParams,
+    /// Optimal quotes from the HJB solve.
+    pub tables: Arc<DepthTables>,
+    /// Trading horizon `T`; remaining time `τ = T − t` indexes the tables.
+    pub horizon: f64,
+    nu: Option<FieldHandle<f64>>,
+    mid: Option<FieldHandle<f64>>,
+    inv: Option<FieldHandle<f64>>,
+    cash: Option<FieldHandle<f64>>,
+}
+
+impl MarketMakingEnsemble {
+    /// A controlled-system ensemble for the given parameters, optimal-quote
+    /// tables, and trading horizon.
+    #[must_use]
+    pub const fn new(params: MarketMakerParams, tables: Arc<DepthTables>, horizon: f64) -> Self {
+        Self {
+            params,
+            tables,
+            horizon,
+            nu: None,
+            mid: None,
+            inv: None,
+            cash: None,
+        }
+    }
+
+    /// Handle of the variance field ν.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the model's fields have not been registered yet.
+    #[must_use]
+    pub const fn nu(&self) -> FieldHandle<f64> {
+        self.nu.expect("model fields not yet registered")
+    }
+
+    /// Handle of the midprice field S.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the model's fields have not been registered yet.
+    #[must_use]
+    pub const fn mid(&self) -> FieldHandle<f64> {
+        self.mid.expect("model fields not yet registered")
+    }
+
+    /// Handle of the inventory field q.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the model's fields have not been registered yet.
+    #[must_use]
+    pub const fn inv(&self) -> FieldHandle<f64> {
+        self.inv.expect("model fields not yet registered")
+    }
+
+    /// Handle of the cash field.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the model's fields have not been registered yet.
+    #[must_use]
+    pub const fn cash(&self) -> FieldHandle<f64> {
+        self.cash.expect("model fields not yet registered")
+    }
+
+    /// Start every path at `(ν₀, S₀)` with zero inventory and cash.
+    pub fn initialize<S: StorageBackend<f64>>(
+        &self,
+        grid: &CartesianGrid<1>,
+        state: &mut State<f64, S>,
+        nu0: f64,
+        s0: f64,
+    ) {
+        for b in 0..grid.num_blocks() {
+            let block = BlockId(b as u32);
+            for (handle, value) in [(self.nu(), nu0), (self.mid(), s0)] {
+                let mut v = state.view_mut(grid, block, handle);
+                for_each_interior(grid.block_cells(), |idx| v.set(idx, value));
+            }
+        }
+    }
+
+    /// Terminal wealth `W = cash + q·S − α·q²` of one path — the mark-to-market
+    /// value after liquidating inventory `q` at the midprice under the terminal
+    /// penalty. The natural functional to reduce over the ensemble.
+    #[must_use]
+    pub fn terminal_wealth(&self, cash: f64, inv: f64, mid: f64) -> f64 {
+        (self.params.alpha * inv).mul_add(-inv, inv.mul_add(mid, cash))
+    }
+}
+
+impl<D: Sync> Model<CartesianGrid<1>, D> for MarketMakingEnsemble {
+    type Scalar = f64;
+    type Drivers = WienerJump<2, 2>;
+
+    fn register_fields(&mut self, builder: &mut StateBuilder<f64>) {
+        self.nu = Some(builder.register_driven("nu", 0, &[Driver::Time, Driver::Wiener(0)]));
+        self.mid = Some(builder.register_driven("mid", 0, &[Driver::Time, Driver::Wiener(1)]));
+        // Inventory and cash are moved only by the two fill channels.
+        self.inv = Some(builder.register_driven("inv", 0, &[Driver::Jump(0), Driver::Jump(1)]));
+        self.cash = Some(builder.register_driven("cash", 0, &[Driver::Jump(0), Driver::Jump(1)]));
+    }
+
+    fn vector_field_block<S: StorageBackend<f64>>(
+        &self,
+        driver: Driver,
+        ctx: &RhsContext<'_, CartesianGrid<1>, D>,
+        state: &State<f64, S>,
+        out: &mut BlockStateMut<'_, f64, S>,
+        _scratch: &mut Scratch<f64, S>,
+    ) {
+        let p = &self.params;
+        let (grid, block) = (ctx.grid, ctx.block);
+        let nu = state.view(grid, block, self.nu());
+        match driver {
+            // CIR variance + midprice drift (full-truncation ν⁺).
+            Driver::Time => {
+                let mut dnu = out.view_mut(grid, block, self.nu());
+                for_each_interior(nu.interior(), |idx| {
+                    dnu.set(idx, p.k_speed * (p.theta - nu.get(idx).max(0.0)));
+                });
+                let mut dmid = out.view_mut(grid, block, self.mid());
+                for_each_interior(nu.interior(), |idx| dmid.set(idx, p.mu));
+            }
+            // Variance diffusion σ√ν⁺.
+            Driver::Wiener(0) => {
+                let mut amp = out.view_mut(grid, block, self.nu());
+                for_each_interior(nu.interior(), |idx| {
+                    amp.set(idx, p.sigma * nu.get(idx).max(0.0).sqrt());
+                });
+            }
+            // Midprice diffusion √ν⁺.
+            Driver::Wiener(1) => {
+                let mut amp = out.view_mut(grid, block, self.mid());
+                for_each_interior(nu.interior(), |idx| amp.set(idx, nu.get(idx).max(0.0).sqrt()));
+            }
+            // Fills: bid (Jump 0) lifts inventory, ask (Jump 1) sheds it. On a
+            // fire the kernel applies both increments together; a withdrawn
+            // side (infinite depth) yields zero intensity, so it never fires
+            // and inventory stays bounded with no explicit clamp. Written in
+            // three cheap passes (the buffer is pre-zeroed, so unwritten cells
+            // stay 0) since the increment and intensity slabs cannot be held
+            // mutably at once.
+            Driver::Jump(channel @ (0 | 1)) => {
+                let tau = self.horizon - ctx.t;
+                let (side, dq) = if channel == 0 {
+                    (&p.buy, 1.0)
+                } else {
+                    (&p.sell, -1.0)
+                };
+                let (mid, inv) = (
+                    state.view(grid, block, self.mid()),
+                    state.view(grid, block, self.inv()),
+                );
+                // δ this channel quotes at, given the current (τ, ν, q).
+                let depth_at = |idx: [isize; 1]| {
+                    let q = inv.get(idx).round() as isize;
+                    let (bid, ask) = self.tables.lookup(tau, nu.get(idx), q);
+                    if channel == 0 { bid } else { ask }
+                };
+                // Inventory step is the constant ±1 (ignored where it does not fire).
+                {
+                    let mut dinv = out.view_mut(grid, block, self.inv());
+                    for_each_interior(nu.interior(), |idx| dinv.set(idx, dq));
+                }
+                // Cash step: bid → δᵇ − S, ask → S + δˢ (only where quoted).
+                {
+                    let mut dcash = out.view_mut(grid, block, self.cash());
+                    for_each_interior(nu.interior(), |idx| {
+                        let depth = depth_at(idx);
+                        if depth.is_finite() {
+                            dcash.set(idx, dq.mul_add(-mid.get(idx), depth));
+                        }
+                    });
+                }
+                // Firing intensity λ·e^{−κδ} (zero on a withdrawn, infinite δ).
+                {
+                    let mut rate = out.intensity_mut(grid, block);
+                    for_each_interior(nu.interior(), |idx| rate.set(idx, side.fill_rate(depth_at(idx))));
+                }
+            }
+            Driver::Wiener(_) | Driver::Jump(_) => {
+                unreachable!("MarketMakingEnsemble declares WienerJump<2,2>")
+            }
+        }
+    }
+
+    /// CIR positivity: reflect any noise-induced excursion `ν < 0` back to 0.
+    fn project<S: StorageBackend<f64>>(&self, grid: &CartesianGrid<1>, state: &mut State<f64, S>) {
+        for b in 0..grid.num_blocks() {
+            let block = BlockId(b as u32);
+            let mut v = state.view_mut(grid, block, self.nu());
+            for_each_interior(grid.block_cells(), |idx| v.set(idx, v.get(idx).max(0.0)));
+        }
     }
 }
