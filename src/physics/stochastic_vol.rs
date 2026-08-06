@@ -165,7 +165,7 @@ impl<D: Sync> Model<CartesianGrid<1>, D> for StochVolPaths {
             Driver::Wiener(1) => {
                 let mut amp = out.view_mut(grid, block, self.mid());
                 for_each_interior(nu.interior(), |idx| {
-                    amp.set(idx, nu.get(idx).max(0.0).sqrt())
+                    amp.set(idx, nu.get(idx).max(0.0).sqrt());
                 });
             }
             Driver::Wiener(_) => unreachable!("StochVolPaths declares Wiener<2>"),

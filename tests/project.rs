@@ -65,7 +65,7 @@ impl<D: Sync> Model<CartesianGrid<1>, D> for ClampedDecay {
             let block = BlockId(b as u32);
             let mut v = state.view_mut(grid, block, self.v.unwrap());
             for_each_interior(grid.block_cells(), |idx| {
-                v.set(idx, v.get(idx).max(self.floor))
+                v.set(idx, v.get(idx).max(self.floor));
             });
         }
     }
@@ -139,7 +139,7 @@ fn run(clamp: bool, steps: usize) -> (Vec<f64>, f64) {
     for b in 0..sim.grid().num_blocks() {
         let view = sim.state().view(sim.grid(), BlockId(b as u32), v);
         for_each_interior(sim.grid().block_cells(), |idx| {
-            final_vals.push(view.get(idx))
+            final_vals.push(view.get(idx));
         });
     }
     let m = *observed_min.lock().unwrap();
