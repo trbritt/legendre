@@ -61,10 +61,11 @@ impl Driver {
     }
 }
 
-/// One field a driver moves, as handed to [`DriverKind::apply_slab`]: its
-/// ghost width, the driver's vector field on this block (`amp`), and the
-/// state slab to update. All ghost-inclusive; ghost entries are skipped by
-/// the stochastic kernels via [`Grid::cell_key`].
+/// One field a driver moves, as handed to [`DriverKind::apply_slab`].
+///
+/// Bundles its ghost width, the driver's vector field on this block (`amp`),
+/// and the state slab to update. All ghost-inclusive; ghost entries are
+/// skipped by the stochastic kernels via [`Grid::cell_key`].
 pub struct DriverField<'a, T> {
     /// Ghost-ring width of this field.
     pub ghost: u32,
@@ -98,6 +99,7 @@ pub trait DriverKind {
     /// ghost width, so correlated diffusion and multi-field jumps are
     /// consistent by construction. Stochastic kernels skip zero-amplitude
     /// entries and never touch ghost entries (gated by [`Grid::cell_key`]).
+    #[allow(clippy::too_many_arguments)]
     fn apply_slab<T: Real, G: Grid>(
         &self,
         grid: &G,
