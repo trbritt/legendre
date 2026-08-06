@@ -168,7 +168,9 @@ impl<D: Sync> Model<CartesianGrid<1>, D> for StochVolPaths {
                     amp.set(idx, nu.get(idx).max(0.0).sqrt());
                 });
             }
-            Driver::Wiener(_) => unreachable!("StochVolPaths declares Wiener<2>"),
+            Driver::Wiener(_) | Driver::Jump(_) => {
+                unreachable!("StochVolPaths declares Wiener<2>")
+            }
         }
     }
 

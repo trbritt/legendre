@@ -25,7 +25,7 @@
 
 use crate::{
     core::{
-        driver::{Driver, DriverKind, DriverSet},
+        driver::{Driver, DriverField, DriverKind, DriverSet},
         scheduler::Scheduler,
         storage::{Allocator, Real, Scalar, StorageBackend},
     },
@@ -208,7 +208,9 @@ impl<T: Scalar> StateBuilder<T> {
     pub fn build<G: Grid, A: Allocator<T>>(self, grid: &G, alloc: &A) -> State<T, A::Storage> {
         let layout = Arc::new(StateLayout { specs: self.specs });
         let blocks = (0..grid.num_blocks())
-            .map(|b| BlockStorage::allocate(&layout, grid, BlockId(b as u32), alloc, |_| true))
+            .map(|b| {
+                BlockStorage::allocate(&layout, grid, BlockId(b as u32), alloc, |_| true, false)
+            })
             .collect();
         State { layout, blocks }
     }
@@ -219,18 +221,26 @@ impl<T: Scalar> StateBuilder<T> {
 #[derive(Debug)]
 pub struct BlockStorage<T: Scalar, S: StorageBackend<T>> {
     fields: Vec<S>,
+    /// Per-interior-cell intensity slab for a jump driver's tendency buffer
+    /// (zero-length for every other buffer). Ghost-free — indexed by the
+    /// interior cell id ([`Grid::cell_key`]) — so it aligns with a jump's
+    /// fire draw regardless of the moved fields' ghost widths.
+    intensity: S,
     _marker: PhantomData<fn() -> T>,
 }
 
 impl<T: Scalar, S: StorageBackend<T>> BlockStorage<T, S> {
-    /// Allocate one block's slabs; fields rejected by `keep` get
-    /// zero-length storage and are skipped by every vector-space operation.
+    /// Allocate one block's slabs; fields rejected by `keep` get zero-length
+    /// storage and are skipped by every vector-space operation. `intensity`
+    /// requests the extra per-interior-cell rate slab of a jump driver's
+    /// tendency buffer (`false` everywhere else).
     fn allocate<G: Grid, A: Allocator<T, Storage = S>>(
         layout: &StateLayout,
         grid: &G,
         block: BlockId,
         alloc: &A,
         keep: impl Fn(&FieldSpec) -> bool,
+        intensity: bool,
     ) -> Self {
         Self {
             fields: layout
@@ -244,6 +254,11 @@ impl<T: Scalar, S: StorageBackend<T>> BlockStorage<T, S> {
                     }
                 })
                 .collect(),
+            intensity: alloc.allocate(if intensity {
+                grid.block_len(block, 0)
+            } else {
+                0
+            }),
             _marker: PhantomData,
         }
     }
@@ -254,19 +269,21 @@ impl<T: Scalar, S: StorageBackend<T>> BlockStorage<T, S> {
         BlockStateMut {
             layout,
             fields: &mut self.fields,
+            intensity: &mut self.intensity,
             _marker: PhantomData,
         }
     }
 }
 
 impl<T: Real, S: StorageBackend<T>> BlockStorage<T, S> {
-    /// Zero every slab of this block. Lets a dispatch fuse "reset the
-    /// accumulator" with the work that fills it, instead of paying a
-    /// separate whole-buffer pass and barrier.
+    /// Zero every slab of this block (fields and the jump intensity). Lets a
+    /// dispatch fuse "reset the accumulator" with the work that fills it,
+    /// instead of paying a separate whole-buffer pass and barrier.
     pub fn fill_zero(&mut self) {
         for field in &mut self.fields {
             field.as_mut_slice().fill(T::ZERO);
         }
+        self.intensity.as_mut_slice().fill(T::ZERO);
     }
 }
 
@@ -295,7 +312,7 @@ impl<T: Scalar, S: StorageBackend<T>> State<T, S> {
     /// every field including statics (snapshot rings, stage *states*).
     #[must_use]
     pub fn like<G: Grid, A: Allocator<T, Storage = S>>(&self, grid: &G, alloc: &A) -> Self {
-        self.like_impl(grid, alloc, |_| true)
+        self.like_impl(grid, alloc, |_| true, false)
     }
 
     /// A congruent *tendency* buffer for one driver: only the fields that
@@ -314,7 +331,9 @@ impl<T: Scalar, S: StorageBackend<T>> State<T, S> {
         alloc: &A,
         driver: Driver,
     ) -> Self {
-        self.like_impl(grid, alloc, |spec| spec.is_driven_by(driver))
+        // A jump driver's tendency buffer also carries a per-cell intensity.
+        let intensity = matches!(driver, Driver::Jump(_));
+        self.like_impl(grid, alloc, |spec| spec.is_driven_by(driver), intensity)
     }
 
     /// A buffer with this state's layout allocated over a *different*
@@ -324,7 +343,16 @@ impl<T: Scalar, S: StorageBackend<T>> State<T, S> {
     #[must_use]
     pub fn reshaped<G: Grid, A: Allocator<T, Storage = S>>(&self, grid: &G, alloc: &A) -> Self {
         let blocks = (0..grid.num_blocks())
-            .map(|b| BlockStorage::allocate(&self.layout, grid, BlockId(b as u32), alloc, |_| true))
+            .map(|b| {
+                BlockStorage::allocate(
+                    &self.layout,
+                    grid,
+                    BlockId(b as u32),
+                    alloc,
+                    |_| true,
+                    false,
+                )
+            })
             .collect();
         Self {
             layout: Arc::clone(&self.layout),
@@ -362,9 +390,19 @@ impl<T: Scalar, S: StorageBackend<T>> State<T, S> {
         grid: &G,
         alloc: &A,
         keep: impl Fn(&FieldSpec) -> bool,
+        intensity: bool,
     ) -> Self {
         let blocks = (0..self.blocks.len())
-            .map(|b| BlockStorage::allocate(&self.layout, grid, BlockId(b as u32), alloc, &keep))
+            .map(|b| {
+                BlockStorage::allocate(
+                    &self.layout,
+                    grid,
+                    BlockId(b as u32),
+                    alloc,
+                    &keep,
+                    intensity,
+                )
+            })
             .collect();
         Self {
             layout: Arc::clone(&self.layout),
@@ -483,23 +521,26 @@ fn block_apply_driver<T: Real, S: StorageBackend<T>, G: Grid>(
     seed: u64,
     salt: u64,
 ) {
-    // The driver's kernel owns the measure scaling (dt, √dt·ξ, …); the
-    // variant match happens here, once per slab — never per cell.
-    for (f, (x, a)) in mine.fields.iter_mut().zip(&amp.fields).enumerate() {
-        if x.is_empty() || a.is_empty() {
-            continue; // field this buffer carries no storage for
-        }
-        driver.apply_slab(
-            grid,
-            block,
-            layout.ghost(f),
-            dt,
-            seed,
-            salt,
-            a.as_slice(),
-            x.as_mut_slice(),
-        );
-    }
+    // Gather the fields this driver moves (both buffers carry storage for
+    // them) into one multi-field call: the kernel shares a single per-cell
+    // draw across them, so correlated diffusion and multi-field jumps stay
+    // consistent. The variant match happens once per block — never per cell.
+    let mut fields: Vec<DriverField<'_, T>> = mine
+        .fields
+        .iter_mut()
+        .zip(&amp.fields)
+        .enumerate()
+        .filter_map(|(f, (x, a))| {
+            (!x.is_empty() && !a.is_empty()).then(|| DriverField {
+                ghost: layout.ghost(f),
+                amp: a.as_slice(),
+                state: x.as_mut_slice(),
+            })
+        })
+        .collect();
+    // A jump driver carries its per-cell intensity alongside the increments.
+    let rate = matches!(driver, Driver::Jump(_)).then(|| amp.intensity.as_slice());
+    driver.apply_slab(grid, block, dt, seed, salt, rate, &mut fields);
 }
 
 impl<T: Real, S: StorageBackend<T>> State<T, S> {
@@ -751,6 +792,7 @@ impl<T: Real, S: StorageBackend<T>> State<T, S> {
 pub struct BlockStateMut<'a, T: Scalar, S: StorageBackend<T>> {
     layout: &'a StateLayout,
     fields: &'a mut [S],
+    intensity: &'a mut S,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -759,6 +801,31 @@ impl<T: Scalar, S: StorageBackend<T>> BlockStateMut<'_, T, S> {
     #[inline(always)]
     pub fn slab_mut(&mut self, handle: FieldHandle<T>) -> &mut [T] {
         self.fields[handle.index()].as_mut_slice()
+    }
+
+    /// Mutable view of this jump driver's per-cell intensity λ (ghost-free).
+    ///
+    /// Only meaningful when the bound buffer is a jump driver's tendency
+    /// buffer (see [`crate::core::driver::Driver::Jump`]); a model's
+    /// `vector_field_block` writes the per-interior-cell firing rate here
+    /// alongside the per-field increments, and the kernel thins against it.
+    /// Ghost-free, so its interior linear index matches [`Grid::cell_key`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer carries no intensity slab (i.e. it is not a jump
+    /// tendency buffer).
+    #[inline]
+    pub fn intensity_mut<'s, G: Grid>(
+        &'s mut self,
+        grid: &'s G,
+        block: BlockId,
+    ) -> G::ViewMut<'s, T> {
+        assert!(
+            !self.intensity.as_slice().is_empty(),
+            "intensity_mut is only available on a jump driver's tendency buffer"
+        );
+        grid.view_mut(block, 0, self.intensity.as_mut_slice())
     }
 
     /// Mutable view of one field.

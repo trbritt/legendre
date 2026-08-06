@@ -40,6 +40,13 @@ pub enum Driver {
     /// by `ΔWⱼ = √dt·ξⱼ`, with ξⱼ drawn per cell from the counter-based
     /// generator (see [`crate::util::rng`]).
     Wiener(usize),
+    /// The `j`-th jump (point-process) driver; this vector field is the
+    /// per-cell increment `ΔJ` applied on the cells where the process fires
+    /// this step. Firing is drawn per cell from the counter-based generator
+    /// as `Bernoulli(1 − e^{−λ·dt})` against the model-supplied per-cell
+    /// intensity λ (see [`crate::util::rng`]); the `rate·dt → probability`
+    /// conversion lives in the kernel, never in model code.
+    Jump(usize),
 }
 
 impl Driver {
@@ -49,32 +56,57 @@ impl Driver {
         match self {
             Self::Time => 0,
             Self::Wiener(j) => (1 << 32) | j as u64,
+            Self::Jump(j) => (2 << 32) | j as u64,
         }
     }
 }
 
-/// The behavior of a driver: its measure as a slab kernel.
+/// One field a driver moves, as handed to [`DriverKind::apply_slab`]: its
+/// ghost width, the driver's vector field on this block (`amp`), and the
+/// state slab to update. All ghost-inclusive; ghost entries are skipped by
+/// the stochastic kernels via [`Grid::cell_key`].
+pub struct DriverField<'a, T> {
+    /// Ghost-ring width of this field.
+    pub ghost: u32,
+    /// The driver's vector field on this block: `b(Y)` for a Wiener driver,
+    /// the increment `ΔJ(Y)` for a jump driver, `dY/dt` for time.
+    pub amp: &'a [T],
+    /// The state slab this driver updates in place.
+    pub state: &'a mut [T],
+}
+
+/// The behavior of a driver: its measure applied across the fields it moves.
 ///
-/// One implementation on [`Driver`] delegates to the kernel of each
-/// variant — static dispatch, resolved once per slab.
+/// One implementation on [`Driver`] delegates to the kernel of each variant —
+/// static dispatch, resolved once per block. A driver moves a *set* of fields
+/// with **one shared per-cell random draw** (the same Wiener deviate, or the
+/// same jump fire), so the kernel is multi-field: correlated components move
+/// together by construction, and a jump moves all its fields on the same fire.
 pub trait DriverKind {
-    /// Apply this driver's increment over one block's slab of one field:
-    /// `state += dμ ∘ amp`, where `dμ` is the driver's measure over a step
-    /// of size `dt` (`dt` itself for [`Driver::Time`]; `√dt·ξ` per cell,
-    /// keyed by `(seed, salt, stream, block, cell)`, for
-    /// [`Driver::Wiener`]). Stochastic kernels skip zero-amplitude entries
-    /// and never touch ghost entries (gated by [`Grid::cell_key`]).
-    #[allow(clippy::too_many_arguments)]
+    /// Apply this driver's measure over one block: for each field in
+    /// `fields`, `state += dμ ∘ amp`, where `dμ` is the measure over a step
+    /// of size `dt` —
+    ///
+    /// - [`Driver::Time`]: `dt` (a uniform axpy, no RNG);
+    /// - [`Driver::Wiener`]: `√dt·ξ` per cell, ξ standard-normal;
+    /// - [`Driver::Jump`]: the field's increment on cells where the process
+    ///   fires, each firing `Bernoulli(1 − e^{−λ·dt})` against the per-cell
+    ///   intensity in `rate` (which is `Some` only for jump drivers).
+    ///
+    /// The per-cell draw is keyed by `(seed, salt, stream, block, cell)` —
+    /// **shared across every field** the driver moves and independent of
+    /// ghost width, so correlated diffusion and multi-field jumps are
+    /// consistent by construction. Stochastic kernels skip zero-amplitude
+    /// entries and never touch ghost entries (gated by [`Grid::cell_key`]).
     fn apply_slab<T: Real, G: Grid>(
         &self,
         grid: &G,
         block: BlockId,
-        ghost: u32,
         dt: f64,
         seed: u64,
         salt: u64,
-        amp: &[T],
-        state: &mut [T],
+        rate: Option<&[T]>,
+        fields: &mut [DriverField<'_, T>],
     );
 }
 
@@ -84,39 +116,66 @@ impl DriverKind for Driver {
         &self,
         grid: &G,
         block: BlockId,
-        ghost: u32,
         dt: f64,
         seed: u64,
         salt: u64,
-        amp: &[T],
-        state: &mut [T],
+        rate: Option<&[T]>,
+        fields: &mut [DriverField<'_, T>],
     ) {
         match *self {
-            // dt is uniform over the slab: a pure axpy, no RNG, no
+            // dt is uniform over the slab: a pure axpy per field, no RNG, no
             // cell-key arithmetic (ghost garbage is refilled before any
             // stencil reads it, exactly as with stage combination).
             Self::Time => {
                 let a = T::from_f64(dt);
-                for (x, v) in state.iter_mut().zip(amp) {
-                    *x += a * *v;
+                for f in fields {
+                    for (x, v) in f.state.iter_mut().zip(f.amp) {
+                        *x += a * *v;
+                    }
                 }
             }
             Self::Wiener(_) => {
                 let scale = T::from_f64(dt.sqrt());
                 let block_key = rng::mix_key(seed, &[salt, self.stream(), block.index() as u64]);
-                for (i, (x, v)) in state.iter_mut().zip(amp).enumerate() {
-                    if *v == T::ZERO {
-                        continue;
+                for f in fields {
+                    for (i, (x, v)) in f.state.iter_mut().zip(f.amp).enumerate() {
+                        if *v == T::ZERO {
+                            continue;
+                        }
+                        // One deviate per (cell, driver, step), broadcast
+                        // across every field the driver moves: the cell id is
+                        // ghost-independent, so correlated multi-component
+                        // dynamics see the same increment on every field.
+                        let Some(cell) = grid.cell_key(block, f.ghost, i) else {
+                            continue;
+                        };
+                        let key = rng::splitmix64(block_key ^ cell);
+                        *x += scale * *v * T::from_f64(rng::standard_normal(key));
                     }
-                    // One deviate per (cell, driver, step), broadcast
-                    // across every field the driver moves: the cell id is
-                    // ghost-independent, so correlated multi-component
-                    // dynamics see the same increment on every field.
-                    let Some(cell) = grid.cell_key(block, ghost, i) else {
-                        continue;
-                    };
-                    let key = rng::splitmix64(block_key ^ cell);
-                    *x += scale * *v * T::from_f64(rng::standard_normal(key));
+                }
+            }
+            Self::Jump(_) => {
+                let rate = rate.expect("a jump driver must be given an intensity slab");
+                let block_key = rng::mix_key(seed, &[salt, self.stream(), block.index() as u64]);
+                for f in fields {
+                    for (i, (x, v)) in f.state.iter_mut().zip(f.amp).enumerate() {
+                        let Some(cell) = grid.cell_key(block, f.ghost, i) else {
+                            continue;
+                        };
+                        let lambda = rate[cell as usize].to_f64();
+                        if lambda <= 0.0 {
+                            continue;
+                        }
+                        // One fire per (cell, driver, step), shared across
+                        // every field the driver moves: the event fires once
+                        // and applies each field's increment together. The
+                        // rate·dt → probability conversion lives here.
+                        let key = rng::splitmix64(block_key ^ cell);
+                        let p = -(-lambda * dt).exp_m1();
+                        if rng::unit_open(key) < p {
+                            *x += *v;
+                        }
+                    }
                 }
             }
         }
@@ -165,5 +224,27 @@ impl<const M: usize> DriverSet for Wiener<M> {
     fn driver(i: usize) -> Driver {
         debug_assert!(i < M);
         Driver::Wiener(i)
+    }
+}
+
+/// Driver set with `W` independent Wiener processes and `J` jump drivers.
+///
+/// The Wiener drivers occupy indices `0..W`, the jump drivers `W..W+J`, so
+/// `driver(i)` yields `Wiener(i)` then `Jump(i−W)`. Mixed diffusion + jump
+/// dynamics — a jump-diffusion asset, a piecewise-deterministic Markov
+/// process, a controlled point process — name this set.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WienerJump<const W: usize, const J: usize>;
+
+impl<const W: usize, const J: usize> DriverSet for WienerJump<W, J> {
+    const LEN: usize = W + J;
+
+    fn driver(i: usize) -> Driver {
+        debug_assert!(i < W + J);
+        if i < W {
+            Driver::Wiener(i)
+        } else {
+            Driver::Jump(i - W)
+        }
     }
 }
