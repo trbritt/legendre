@@ -411,7 +411,10 @@ impl DepthTables {
             f64::MAX
         };
 
-        let (mut bid, mut ask) = (Vec::with_capacity(surfaces.len()), Vec::with_capacity(surfaces.len()));
+        let (mut bid, mut ask) = (
+            Vec::with_capacity(surfaces.len()),
+            Vec::with_capacity(surfaces.len()),
+        );
         for surface in surfaces {
             let mut b = vec![0.0; nq * n_nu];
             let mut a = vec![0.0; nq * n_nu];
@@ -459,8 +462,9 @@ impl DepthTables {
     }
 }
 
-/// The **controlled** market-making system as a Monte Carlo path ensemble —
-/// one path per grid cell (a 0-dimensional SDE per cell; see
+/// The **controlled** market-making system as a Monte Carlo path ensemble.
+///
+/// One path per grid cell (a 0-dimensional SDE per cell; see
 /// [`crate::physics::stochastic_vol`]). Pairs with the
 /// [`crate::core::monte_carlo`] harness.
 ///
@@ -613,7 +617,9 @@ impl<D: Sync> Model<CartesianGrid<1>, D> for MarketMakingEnsemble {
             // Midprice diffusion √ν⁺.
             Driver::Wiener(1) => {
                 let mut amp = out.view_mut(grid, block, self.mid());
-                for_each_interior(nu.interior(), |idx| amp.set(idx, nu.get(idx).max(0.0).sqrt()));
+                for_each_interior(nu.interior(), |idx| {
+                    amp.set(idx, nu.get(idx).max(0.0).sqrt())
+                });
             }
             // Fills: bid (Jump 0) lifts inventory, ask (Jump 1) sheds it. On a
             // fire the kernel applies both increments together; a withdrawn
@@ -657,7 +663,9 @@ impl<D: Sync> Model<CartesianGrid<1>, D> for MarketMakingEnsemble {
                 // Firing intensity λ·e^{−κδ} (zero on a withdrawn, infinite δ).
                 {
                     let mut rate = out.intensity_mut(grid, block);
-                    for_each_interior(nu.interior(), |idx| rate.set(idx, side.fill_rate(depth_at(idx))));
+                    for_each_interior(nu.interior(), |idx| {
+                        rate.set(idx, side.fill_rate(depth_at(idx)))
+                    });
                 }
             }
             Driver::Wiener(_) | Driver::Jump(_) => {

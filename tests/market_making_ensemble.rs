@@ -19,7 +19,9 @@ use legendre::{
     },
     integrators::{EulerMaruyama, ForwardEuler},
     physics::{
-        market_making::{DepthTables, HjbMarketMaker, MarketMakerParams, MarketMakingEnsemble, Side},
+        market_making::{
+            DepthTables, HjbMarketMaker, MarketMakerParams, MarketMakingEnsemble, Side,
+        },
         model::Model,
     },
 };
@@ -113,11 +115,7 @@ fn simulate<Sch: Scheduler>(
 
     // Stage 2: controlled ensemble on the generic Monte Carlo harness.
     let grid = path_grid(paths, 4000).unwrap();
-    // DEBUG: zero fill intensities to isolate the pure SDE.
-    let mut ens_params = params;
-    ens_params.buy.lambda = 0.0;
-    ens_params.sell.lambda = 0.0;
-    let model = MarketMakingEnsemble::new(ens_params, Arc::clone(&tables), horizon);
+    let model = MarketMakingEnsemble::new(params, Arc::clone(&tables), horizon);
     let sim = Simulation::new(
         grid,
         (),
@@ -132,51 +130,11 @@ fn simulate<Sch: Scheduler>(
         let (g, state) = mc.simulation_mut().state_mut();
         model.initialize(g, state, nu0, s0);
     }
-    {
-        let m = mc.simulation().model().clone();
-        eprintln!(
-            "DEBUG post-init mid={:.4} cash={:.4}",
-            mc.stats(|p| p.get(m.mid())).mean,
-            mc.stats(|p| p.get(m.cash())).mean,
-        );
-    }
-    {
-        let m = mc.simulation().model().clone();
-        for s in 0..steps {
-            mc.run(1, dt);
-            if s < 3 {
-                eprintln!(
-                    "DEBUG step {s}: mid={:.4} cash={:.4} inv={:.4}",
-                    mc.stats(|p| p.get(m.mid())).mean,
-                    mc.stats(|p| p.get(m.cash())).mean,
-                    mc.stats(|p| p.get(m.inv())).mean,
-                );
-            }
-        }
-    }
+    mc.run(steps, dt);
 
     let model = mc.simulation().model().clone();
-    let (inv_h, cash_h, mid_h) = (model.inv(), model.mid(), model.cash());
+    let (inv_h, cash_h, mid_h) = (model.inv(), model.cash(), model.mid());
     let wealth = mc.stats(|p| model.terminal_wealth(p.get(cash_h), p.get(inv_h), p.get(mid_h)));
-
-    eprintln!(
-        "DEBUG idx nu={} mid={} inv={} cash={}",
-        model.nu().index(),
-        model.mid().index(),
-        model.inv().index(),
-        model.cash().index(),
-    );
-    let nu_stats = mc.stats(|p| p.get(model.nu()));
-    eprintln!(
-        "DEBUG inv={:.4} cash={:.4} mid={:.4} nu(mean={:.4},min={:.4},max={:.4}) wealth={:.4}",
-        mc.stats(|p| p.get(inv_h)).mean,
-        mc.stats(|p| p.get(cash_h)).mean,
-        mc.stats(|p| p.get(mid_h)).mean,
-        nu_stats.mean,
-        nu_stats.min,
-        nu_stats.max,
-        wealth.mean,
-    );
 
     let mut inv = Vec::with_capacity(paths);
     for b in 0..mc.simulation().grid().num_blocks() {
@@ -184,7 +142,9 @@ fn simulate<Sch: Scheduler>(
             .simulation()
             .state()
             .view(mc.simulation().grid(), BlockId(b as u32), inv_h);
-        for_each_interior(mc.simulation().grid().block_cells(), |idx| inv.push(v.get(idx)));
+        for_each_interior(mc.simulation().grid().block_cells(), |idx| {
+            inv.push(v.get(idx))
+        });
     }
     Terminal {
         inv,
@@ -253,7 +213,15 @@ fn symmetric_book_has_no_inventory_bias() {
 #[test]
 fn controlled_ensemble_is_scheduler_independent() {
     let params = MarketMakerParams::default();
-    let s = simulate(params, 2.0, params.theta, 100.0, 16_000, 42, SerialScheduler);
+    let s = simulate(
+        params,
+        2.0,
+        params.theta,
+        100.0,
+        16_000,
+        42,
+        SerialScheduler,
+    );
     let p = simulate(params, 2.0, params.theta, 100.0, 16_000, 42, RayonScheduler);
     assert_eq!(s.inv, p.inv, "inventory paths must be schedule-independent");
     assert_eq!(
