@@ -1,29 +1,30 @@
 //! Physical boundary conditions for cell-centered ghost fills.
 //!
-//! A ghost cell outside the physical domain is filled from its **mirror
-//! image** inside the domain, transformed by the boundary condition on the
-//! face it sits behind. Every condition here is a per-layer *linear
-//! reflection* of the mirror-image interior value `src`, so they compose with
-//! the dimension-split ghost sweep the grid families already run and cost the
-//! same as the no-flux mirror:
+//! A ghost cell outside the physical domain is filled from the field's
+//! **interior cells along the outward normal**, transformed by the boundary
+//! condition on the face it sits behind. Each condition is handed the ghost
+//! layer `k` (0 = innermost), the normal spacing `h`, and a lazy accessor
+//! `interior(j)` returning the `j`-th interior cell measured inward from the
+//! face (`j = 0` the edge cell, `j = 1` the next one in), and returns the
+//! ghost value:
 //!
-//! ```text
-//! ghost(k) = a·src + b        (k = ghost layer, 0 = innermost)
-//! ```
+//! | Condition                | face relation              | ghost(k)                     |
+//! |--------------------------|----------------------------|------------------------------|
+//! | [`FaceBc::Mirror`]       | ∂u/∂n = 0 (no-flux)        | `interior(k)`                |
+//! | [`FaceBc::Dirichlet`]    | u = v at the face          | `2v − interior(k)`           |
+//! | [`FaceBc::Flux`]         | ∂u/∂n = g (outward normal) | `interior(k) + (2k+1)·h·g`   |
+//! | [`FaceBc::Extrapolate`]  | ∂²u/∂n² = 0 (linear)       | `(k+2)·interior(0) − (k+1)·interior(1)` |
 //!
-//! | Condition                | face relation              | a  | b                 |
-//! |--------------------------|----------------------------|----|-------------------|
-//! | [`FaceBc::Mirror`]       | ∂u/∂n = 0 (no-flux)        |  1 | 0                 |
-//! | [`FaceBc::Dirichlet`]    | u = v at the face          | −1 | 2v                |
-//! | [`FaceBc::Flux`]         | ∂u/∂n = g (outward normal) |  1 | (2k+1)·h·g        |
-//!
-//! `src` is the value at the mirror-image interior cell (found by reflecting
-//! the ghost coordinate across the boundary with [`reflect_coord`]); `h` is
-//! the cell spacing normal to the face; `2k+1` is the odd cell distance
-//! between a ghost layer and its source ([`reflect_steps`]). Robin and
-//! time-dependent conditions slot into the same closure-driven fill: a model
-//! returns a `FaceBc` per (dimension, side) — and, for time-dependent
-//! forcing, closes over the evaluation time it is handed in `fill_ghosts`.
+//! The first three read a single interior cell (`interior(k)`, the mirror
+//! image found by reflecting the ghost coordinate across the boundary — see
+//! [`reflect_coord`]); [`FaceBc::Extrapolate`] is the multi-point member,
+//! reading the two edge cells to continue the field linearly (a transparent
+//! outflow condition — no spurious curvature at the face). The accessor is
+//! lazy so a condition reads only the cells it needs, keeping the no-flux
+//! mirror a single copy. Robin and time-dependent conditions slot into the
+//! same closure-driven fill: a model returns a `FaceBc` per (dimension, side)
+//! — and, for time-dependent forcing, closes over the evaluation time it is
+//! handed in `fill_ghosts`.
 
 use crate::core::storage::Real;
 
@@ -34,29 +35,40 @@ use crate::core::storage::Real;
 /// them before any boundary rule is consulted.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FaceBc {
-    /// Homogeneous Neumann (no-flux): even reflection, `ghost = src`. The
-    /// default for conservative diffusion — total quantity is preserved.
+    /// Homogeneous Neumann (no-flux): even reflection, `ghost = interior(k)`.
+    /// The default for conservative diffusion — total quantity is preserved.
     Mirror,
     /// Dirichlet: the field equals `value` *at the face*. Odd reflection
-    /// about `value`, `ghost = 2·value − src`.
+    /// about `value`, `ghost = 2·value − interior(k)`.
     Dirichlet(f64),
     /// Inhomogeneous Neumann: the outward normal derivative ∂u/∂n equals
-    /// `flux` at the face. `ghost = src + (2k+1)·h·flux`. `Flux(0.0)` is
-    /// exactly [`FaceBc::Mirror`].
+    /// `flux` at the face. `ghost = interior(k) + (2k+1)·h·flux`. `Flux(0.0)`
+    /// is exactly [`FaceBc::Mirror`].
     Flux(f64),
+    /// Linear extrapolation (zero second normal derivative): continue the
+    /// field linearly from the two edge cells,
+    /// `ghost = (k+2)·interior(0) − (k+1)·interior(1)`. A transparent
+    /// outflow condition; requires at least two interior cells across the
+    /// block in the normal direction.
+    Extrapolate,
 }
 
 impl FaceBc {
-    /// The ghost value from its mirror-image interior source `src`, the odd
-    /// cell distance `steps` = 2k+1 to that source, and the normal spacing
-    /// `h`. See the module docs for the per-condition formula.
+    /// The ghost value at layer `k` (0 = innermost), from the normal spacing
+    /// `h` and a lazy accessor to the interior cells along the outward normal
+    /// (`interior(j)` = the `j`-th interior cell, `j = 0` the edge). See the
+    /// module docs for the per-condition formula.
     #[inline]
     #[must_use]
-    pub(crate) fn ghost_value<T: Real>(self, src: T, steps: i64, h: f64) -> T {
+    pub(crate) fn ghost_value<T: Real>(self, k: i64, h: f64, interior: impl Fn(i64) -> T) -> T {
         match self {
-            Self::Mirror => src,
-            Self::Dirichlet(value) => T::from_f64(2.0 * value) - src,
-            Self::Flux(flux) => src + T::from_f64(steps as f64 * h * flux),
+            Self::Mirror => interior(k),
+            Self::Dirichlet(value) => T::from_f64(2.0 * value) - interior(k),
+            Self::Flux(flux) => interior(k) + T::from_f64((2 * k + 1) as f64 * h * flux),
+            Self::Extrapolate => {
+                T::from_f64((k + 2) as f64) * interior(0)
+                    - T::from_f64((k + 1) as f64) * interior(1)
+            }
         }
     }
 }
@@ -74,21 +86,6 @@ pub(crate) const fn reflect_coord(c: i64, lo: i64, hi: i64) -> i64 {
         2 * hi - 1 - c
     } else {
         c
-    }
-}
-
-/// Odd cell distance `2k+1` between an out-of-interior coordinate `c` and its
-/// [`reflect_coord`] image across a `[lo, hi)` interval; `1` for interior
-/// coordinates. Used to place inhomogeneous-flux ghost layers.
-#[inline]
-#[must_use]
-pub(crate) const fn reflect_steps(c: i64, lo: i64, hi: i64) -> i64 {
-    if c < lo {
-        2 * (lo - c) - 1
-    } else if c >= hi {
-        2 * (c - hi) + 1
-    } else {
-        1
     }
 }
 
@@ -113,38 +110,42 @@ mod tests {
     }
 
     #[test]
-    fn reflect_steps_is_odd_distance() {
-        let n = 5;
-        assert_eq!(reflect_steps(-1, 0, n), 1);
-        assert_eq!(reflect_steps(-2, 0, n), 3);
-        assert_eq!(reflect_steps(-3, 0, n), 5);
-        assert_eq!(reflect_steps(n, 0, n), 1);
-        assert_eq!(reflect_steps(n + 1, 0, n), 3);
-    }
-
-    #[test]
     fn mirror_is_flux_zero() {
-        let src = 1.25_f64;
-        assert_eq!(FaceBc::Mirror.ghost_value(src, 1, 0.4), src);
-        assert_eq!(FaceBc::Flux(0.0).ghost_value(src, 3, 0.4), src);
+        // A monotone interior line; mirror at layer k reads interior(k).
+        let interior = |j: i64| 1.25 + j as f64;
+        assert_eq!(FaceBc::Mirror.ghost_value(0, 0.4, interior), interior(0));
+        assert_eq!(FaceBc::Flux(0.0).ghost_value(2, 0.4, interior), interior(2));
     }
 
     #[test]
     fn dirichlet_puts_value_on_the_face() {
-        // (ghost + interior)/2 == value  at the innermost layer (steps=1).
-        let interior = 0.3_f64;
+        // (ghost + interior)/2 == value  at the innermost layer (k = 0).
+        let edge = 0.3_f64;
         let value = 2.0_f64;
-        let ghost = FaceBc::Dirichlet(value).ghost_value(interior, 1, 0.4);
-        assert!((0.5 * (ghost + interior) - value).abs() < 1e-15);
+        let ghost = FaceBc::Dirichlet(value).ghost_value(0, 0.4, |_| edge);
+        assert!((0.5 * (ghost + edge) - value).abs() < 1e-15);
     }
 
     #[test]
     fn flux_sets_the_normal_gradient() {
         // (ghost - interior)/h == g  at the innermost layer (outward normal,
         // low face: the one-sided gradient across the boundary face).
-        let interior = 0.3_f64;
+        let edge = 0.3_f64;
         let (g, h) = (1.5_f64, 0.4_f64);
-        let ghost = FaceBc::Flux(g).ghost_value(interior, 1, h);
-        assert!(((ghost - interior) / h - g).abs() < 1e-15);
+        let ghost = FaceBc::Flux(g).ghost_value(0, h, |_| edge);
+        assert!(((ghost - edge) / h - g).abs() < 1e-15);
+    }
+
+    #[test]
+    fn extrapolate_continues_the_line() {
+        // A field linear in the normal coordinate is reproduced exactly at
+        // every ghost layer: edge - inner is the per-cell slope, and layer k
+        // sits k+1 cells beyond the edge.
+        let (edge, slope) = (2.0_f64, 0.5_f64);
+        let interior = |j: i64| edge - slope * j as f64; // interior(0)=edge, interior(1)=edge-slope
+        for k in 0..3 {
+            let ghost = FaceBc::Extrapolate.ghost_value(k, 0.4, interior);
+            assert!((ghost - (edge + slope * (k + 1) as f64)).abs() < 1e-15);
+        }
     }
 }
