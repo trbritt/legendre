@@ -66,7 +66,7 @@ use crate::{
         cartesian::{CartesianGrid, fill_ghosts_extrapolate, for_each_interior},
         grid::{BlockId, Grid},
     },
-    physics::model::{Driver, Model, NoNoise, RhsContext},
+    physics::model::{Driver, Model, NoNoise, RhsContext, StiffRow},
 };
 use std::sync::Arc;
 
@@ -339,6 +339,72 @@ impl<D: Sync> Model<CartesianGrid<1>, D> for HjbMarketMaker {
                 du.set(idx, value);
             });
         }
+    }
+
+    /// The stiff ν advection–diffusion operator `L`, one tridiagonal row per
+    /// interior cell — the linear part of the drift that carries the explicit
+    /// scheme's `dt ∝ dν²` stiffness. Identical for every inventory level
+    /// (the ν dynamics do not depend on q), so `field` is ignored; only the
+    /// nonlinear, cross-`q` fill terms and the source are left to the
+    /// explicit remainder. The linear-extrapolation ν boundary
+    /// ([`fill_ghosts_extrapolate`], `ghost = 2·edge − inner`) is folded into
+    /// the first and last domain rows, since the implicit solve sees no
+    /// ghosts. The rows sum to zero (a pure transport operator), and
+    /// `I − dt·L` is an M-matrix — the backward solve is unconditionally
+    /// stable and monotone.
+    fn stiff_rows(
+        &self,
+        grid: &CartesianGrid<1>,
+        block: BlockId,
+        _field: FieldHandle<f64>,
+        rows: &mut [StiffRow],
+    ) -> bool {
+        let p = &self.params;
+        let dnu = grid.spacing(block)[0];
+        let inv_dnu = 1.0 / dnu;
+        let inv_dnu2 = inv_dnu * inv_dnu;
+        let sigma2 = p.sigma * p.sigma;
+        let bc = grid.block_cells()[0];
+        let n = grid.cells()[0];
+        let base = block.index() * bc;
+
+        for (i, row) in rows.iter_mut().enumerate() {
+            let nu = grid.cell_center(block, [i as isize])[0];
+            let a = 0.5 * sigma2 * nu * inv_dnu2; // central diffusion
+            let drift = p.k_speed * (p.theta - nu); // upwind advection
+            let adv = drift * inv_dnu;
+            // Interior tridiagonal (matches the explicit RHS exactly):
+            //   diffusion a·(u₋ − 2u + u₊); upwind adv on the sign of drift.
+            let mut lo = a + if drift <= 0.0 { -adv } else { 0.0 };
+            let mut ctr = 2.0f64.mul_add(-a, -drift.abs() * inv_dnu);
+            let mut hi = a + if drift > 0.0 { adv } else { 0.0 };
+
+            // Fold the linear-extrapolation ghost (2·edge − inner) at the
+            // physical domain ends into the interior stencil.
+            let global = base + i;
+            if global == 0 {
+                ctr += 2.0 * lo;
+                hi -= lo;
+                lo = 0.0;
+            }
+            if global == n - 1 {
+                ctr += 2.0 * hi;
+                lo -= hi;
+                hi = 0.0;
+            }
+            *row = [lo, ctr, hi];
+        }
+        true
+    }
+
+    /// Stable dt of the nonstiff remainder (`N = V₀ − L·Y` = source + fill
+    /// terms): a bounded reaction with **no dν dependence**, so an IMEX
+    /// scheme's step is capped by the fill intensity, not the grid. Gershgorin
+    /// on the fill Jacobian bounds the spectral radius by `2·(λˢ + λᵇ)`; a 0.4
+    /// safety factor gives the bound below.
+    fn stable_dt_nonstiff(&self, _spacing: [f64; 1]) -> Option<f64> {
+        let rate = self.params.sell.lambda + self.params.buy.lambda;
+        (rate > 0.0).then(|| 0.4 / rate)
     }
 
     /// Binding CFL bound of the explicit upwind/central scheme. Diffusion
@@ -618,7 +684,7 @@ impl<D: Sync> Model<CartesianGrid<1>, D> for MarketMakingEnsemble {
             Driver::Wiener(1) => {
                 let mut amp = out.view_mut(grid, block, self.mid());
                 for_each_interior(nu.interior(), |idx| {
-                    amp.set(idx, nu.get(idx).max(0.0).sqrt())
+                    amp.set(idx, nu.get(idx).max(0.0).sqrt());
                 });
             }
             // Fills: bid (Jump 0) lifts inventory, ask (Jump 1) sheds it. On a
@@ -664,7 +730,7 @@ impl<D: Sync> Model<CartesianGrid<1>, D> for MarketMakingEnsemble {
                 {
                     let mut rate = out.intensity_mut(grid, block);
                     for_each_interior(nu.interior(), |idx| {
-                        rate.set(idx, side.fill_rate(depth_at(idx)))
+                        rate.set(idx, side.fill_rate(depth_at(idx)));
                     });
                 }
             }

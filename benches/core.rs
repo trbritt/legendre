@@ -33,7 +33,7 @@ use legendre::{
     core::{
         driver::{Driver, DriverSet},
         monte_carlo::path_grid,
-        scheduler::{RayonScheduler, Scheduler, SerialScheduler},
+        scheduler::SerialScheduler,
         simulation::Simulation,
         state::{FieldHandle, State, StateBuilder},
         storage::{DenseStorage, SystemAllocator},
@@ -44,7 +44,7 @@ use legendre::{
         cartesian::{CartesianGrid, fill_ghosts_mirror, for_each_interior},
         grid::{BlockId, Grid},
     },
-    integrators::{EulerMaruyama, ForwardEuler, Integrator, RungeKutta4, Subcycling},
+    integrators::{EulerMaruyama, ForwardEuler, ImexEuler, Integrator, RungeKutta4, Subcycling},
     physics::{
         market_making::{DepthTables, HjbMarketMaker, MarketMakerParams, MarketMakingEnsemble},
         model::{NoNoise, Wiener},
@@ -286,9 +286,22 @@ const NU_CELLS: usize = 100;
 const NU_BLOCK: usize = 25;
 const HORIZON: f64 = 3.0;
 
-type HjbSim = Simulation<CartesianGrid<1>, (), HjbMarketMaker, ForwardEuler, SerialScheduler, SystemAllocator>;
-type EnsembleSim =
-    Simulation<CartesianGrid<1>, (), MarketMakingEnsemble, EulerMaruyama, SerialScheduler, SystemAllocator>;
+type HjbSim = Simulation<
+    CartesianGrid<1>,
+    (),
+    HjbMarketMaker,
+    ForwardEuler,
+    SerialScheduler,
+    SystemAllocator,
+>;
+type EnsembleSim = Simulation<
+    CartesianGrid<1>,
+    (),
+    MarketMakingEnsemble,
+    EulerMaruyama,
+    SerialScheduler,
+    SystemAllocator,
+>;
 
 fn nu_grid() -> CartesianGrid<1> {
     let (lo, hi) = (0.001, 2.0);
@@ -358,23 +371,42 @@ fn ensemble_sim(params: MarketMakerParams, tables: Arc<DepthTables>) -> Ensemble
     sim
 }
 
-/// Full backward-time HJB re-solve to the horizon (state reset to the zero
-/// terminal condition each iteration) — the policy-refresh latency itself.
-fn bench_hjb_solve<Sch: Scheduler>(
-    c: &mut Criterion,
-    name: &str,
-    scheduler: Sch,
-    cells: usize,
-    block: usize,
-) {
+fn hjb_grid(cells: usize, block: usize) -> CartesianGrid<1> {
     let (lo, hi) = (0.001, 2.0);
-    let grid = CartesianGrid::new([cells], [block], [lo], [(hi - lo) / cells as f64]).unwrap();
+    CartesianGrid::new([cells], [block], [lo], [(hi - lo) / cells as f64]).unwrap()
+}
+
+/// Full backward-time explicit HJB re-solve to the horizon (state reset to
+/// the zero terminal condition each iteration) — the policy-refresh latency.
+fn bench_hjb_solve(c: &mut Criterion, name: &str, cells: usize, block: usize) {
     let mut sim = Simulation::new(
-        grid,
+        hjb_grid(cells, block),
         (),
         HjbMarketMaker::new(MarketMakerParams::default()),
         ForwardEuler,
-        scheduler,
+        SerialScheduler,
+        SystemAllocator,
+    );
+    let dt = sim.stable_dt().unwrap();
+    let steps = (HORIZON / dt).ceil() as usize;
+    c.bench_function(name, |b| {
+        b.iter(|| {
+            sim.state_mut().1.fill_zero();
+            for _ in 0..steps {
+                sim.step(dt);
+            }
+        });
+    });
+}
+
+/// The same re-solve under the IMEX scheme (implicit ν operator, dν-free dt).
+fn bench_hjb_solve_imex(c: &mut Criterion, name: &str, cells: usize, block: usize) {
+    let mut sim = Simulation::new(
+        hjb_grid(cells, block),
+        (),
+        HjbMarketMaker::new(MarketMakerParams::default()),
+        ImexEuler,
+        SerialScheduler,
         SystemAllocator,
     );
     let dt = sim.stable_dt().unwrap();
@@ -399,12 +431,12 @@ fn market_making(c: &mut Criterion) {
         b.iter(|| sim.step(dt));
     });
 
-    // Full re-solve latency: the cheap, bit-exact levers (parallelism, grid
-    // resolution) measured against the serial baseline.
-    bench_hjb_solve(c, "mm/hjb/solve/serial_n100", SerialScheduler, 100, 25);
-    bench_hjb_solve(c, "mm/hjb/solve/rayon_n100", RayonScheduler, 100, 10);
-    bench_hjb_solve(c, "mm/hjb/solve/serial_n50", SerialScheduler, 50, 25);
-    bench_hjb_solve(c, "mm/hjb/solve/serial_n200", SerialScheduler, 200, 25);
+    // Full re-solve latency, explicit forward Euler (dt ∝ dν²) vs the IMEX
+    // scheme (dν-independent dt): the policy-refresh speedup.
+    bench_hjb_solve(c, "mm/hjb/solve/explicit_n100", 100, 25);
+    bench_hjb_solve(c, "mm/hjb/solve/explicit_n200", 200, 25);
+    bench_hjb_solve_imex(c, "mm/hjb/solve/imex_n100", 100, 25);
+    bench_hjb_solve_imex(c, "mm/hjb/solve/imex_n200", 200, 25);
 
     // Backtest throughput: one Euler–Maruyama step of the controlled ensemble.
     c.bench_function("mm/ensemble/step", |b| {

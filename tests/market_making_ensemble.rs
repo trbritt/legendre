@@ -143,7 +143,7 @@ fn simulate<Sch: Scheduler>(
             .state()
             .view(mc.simulation().grid(), BlockId(b as u32), inv_h);
         for_each_interior(mc.simulation().grid().block_cells(), |idx| {
-            inv.push(v.get(idx))
+            inv.push(v.get(idx));
         });
     }
     Terminal {
