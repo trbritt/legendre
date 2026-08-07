@@ -213,7 +213,7 @@ impl<D: Sync> Model<CartesianGrid<1>, D> for Decay {
         let v = state.view(ctx.grid, ctx.block, self.v.unwrap());
         let mut dv = out.view_mut(ctx.grid, ctx.block, self.v.unwrap());
         for_each_interior(ctx.grid.block_cells(), |idx| {
-            dv.set(idx, -self.rate * v.get(idx))
+            dv.set(idx, -self.rate * v.get(idx));
         });
     }
 }
