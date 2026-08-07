@@ -2,6 +2,7 @@
 //! simulation owner. Everything here is grid- and physics-agnostic.
 
 pub mod driver;
+pub mod monte_carlo;
 pub mod observer;
 pub mod scheduler;
 pub mod scratch;

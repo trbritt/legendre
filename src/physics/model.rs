@@ -111,13 +111,21 @@ pub trait Model<G: Grid, D>: Send + Sync {
     ///
     /// For [`Driver::Time`], write dY/dt into the interior cells of every
     /// time-driven field (`out` arrives with unspecified contents, as
-    /// models overwrite it). For a stochastic driver, write the *amplitude*
-    /// Vⱼ(Y) into the interior cells of the fields registered as driven by
-    /// it (`out` arrives zeroed and carries storage only for those fields;
-    /// see [`StateBuilder::register_driven`]); the integrator applies the
-    /// driver's measure with one increment per cell, broadcast across
+    /// models overwrite it). For a [`Driver::Wiener`] driver, write the
+    /// *amplitude* Vⱼ(Y) into the interior cells of the fields registered as
+    /// driven by it (`out` arrives zeroed and carries storage only for those
+    /// fields; see [`StateBuilder::register_driven`]); the integrator applies
+    /// the driver's measure with one increment per cell, broadcast across
     /// fields, so a driver shared by several fields moves them with the
     /// *same* increment.
+    ///
+    /// For a [`Driver::Jump`] driver, write the per-field *increment* `ΔJ(Y)`
+    /// into those same driven-field slabs **and** the per-cell firing
+    /// intensity λ(Y) into `out.intensity_mut(grid, block)`; the integrator
+    /// draws one fire per cell against λ (`1 − e^{−λ·dt}`) and, on cells that
+    /// fire, applies every field's increment together. The `rate·dt →
+    /// probability` conversion is the kernel's, never the model's — mirroring
+    /// the `√dt` rule for Wiener amplitudes.
     ///
     /// Models with `Drivers = NoNoise` only ever receive [`Driver::Time`].
     fn vector_field_block<S: StorageBackend<Self::Scalar>>(
