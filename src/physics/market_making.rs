@@ -383,12 +383,12 @@ impl<D: Sync> Model<CartesianGrid<1>, D> for HjbMarketMaker {
             // physical domain ends into the interior stencil.
             let global = base + i;
             if global == 0 {
-                ctr += 2.0 * lo;
+                ctr += 2.0f64.mul_add(lo, ctr);
                 hi -= lo;
                 lo = 0.0;
             }
             if global == n - 1 {
-                ctr += 2.0 * hi;
+                ctr += 2.0f64.mul_add(hi, ctr);
                 lo -= hi;
                 hi = 0.0;
             }
