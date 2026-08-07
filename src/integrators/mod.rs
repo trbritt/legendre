@@ -29,6 +29,7 @@
 
 mod euler;
 mod euler_maruyama;
+mod imex;
 mod rk4;
 mod subcycling;
 
@@ -40,6 +41,7 @@ use crate::{
 
 pub use euler::ForwardEuler;
 pub use euler_maruyama::EulerMaruyama;
+pub use imex::ImexEuler;
 pub use rk4::RungeKutta4;
 pub use subcycling::Subcycling;
 
