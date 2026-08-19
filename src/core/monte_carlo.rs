@@ -112,7 +112,7 @@ where
                 idx,
             });
             sum += value;
-            sum2 += value * value;
+            sum2 = value.mul_add(value, sum2);
             count += 1;
             min = min.min(value);
             max = max.max(value);

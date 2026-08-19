@@ -133,7 +133,7 @@ fn run<Sch: Scheduler>(
         let base = b * block;
         let mut v = state.view_mut(g, blk, lam_h);
         for_each_interior(g.block_cells(), |idx| {
-            v.set(idx, lam_of(base + idx[0] as usize))
+            v.set(idx, lam_of(base + idx[0] as usize));
         });
     }
 

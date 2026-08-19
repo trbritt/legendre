@@ -54,7 +54,15 @@ use crate::{
     geometry::grid::{BlockId, Grid},
 };
 
-pub use crate::core::driver::{Driver, DriverKind, DriverSet, NoNoise, Wiener};
+pub use crate::core::driver::{Driver, DriverKind, DriverSet, NoNoise, Wiener, WienerJump};
+
+/// One row of a stiff tridiagonal operator along dimension 0:
+/// `(L·y)ᵢ = row[0]·yᵢ₋₁ + row[1]·yᵢ + row[2]·yᵢ₊₁`.
+///
+/// Written by [`Model::stiff_rows`] and consumed by IMEX schemes
+/// ([`crate::integrators::ImexEuler`]); coefficients are scheme-level reals
+/// (like `dt`), independent of the model's scalar type.
+pub type StiffRow = [f64; 3];
 
 /// Everything a model may consult while evaluating one block's vector
 /// field. Deliberately read-only and allocation-free.
@@ -152,6 +160,40 @@ pub trait Model<G: Grid, D>: Send + Sync {
         _grid: &G,
         _state: &mut State<Self::Scalar, S>,
     ) {
+    }
+
+    /// The stiff linear tridiagonal part `L` (along dimension 0) of this
+    /// model's time vector field on one block of `field`.
+    ///
+    /// Write one [`StiffRow`] per interior cell into `rows` and return
+    /// `true`. Rows at *physical domain boundaries* must fold the model's
+    /// boundary condition into the coefficients — the implicit solve sees no
+    /// ghosts. Returning `false` (the default) declares the field has no
+    /// stiff part: IMEX schemes then treat it fully explicitly, and a model
+    /// with no stiff field anywhere degenerates
+    /// [`ImexEuler`](crate::integrators::ImexEuler) to forward Euler bit for
+    /// bit.
+    ///
+    /// Only consulted by IMEX schemes. [`Model::vector_field_block`] remains
+    /// the *complete* dynamics — an IMEX scheme subtracts `L·Y` itself, so
+    /// this split can never drift out of sync with the physics.
+    fn stiff_rows(
+        &self,
+        _grid: &G,
+        _block: BlockId,
+        _field: crate::core::state::FieldHandle<Self::Scalar>,
+        _rows: &mut [StiffRow],
+    ) -> bool {
+        false
+    }
+
+    /// Stable timestep of the **nonstiff remainder** `N = V₀ − L·Y` alone —
+    /// the dt bound an IMEX scheme must respect once the stiff part is
+    /// integrated implicitly (independent of grid spacing for a
+    /// diffusion-stiff model). `None` (the default) falls back to
+    /// [`Model::stable_dt`].
+    fn stable_dt_nonstiff(&self, _spacing: G::Point) -> Option<f64> {
+        None
     }
 
     /// Largest stable explicit timestep for a cell of the given `spacing`,

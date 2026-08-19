@@ -28,27 +28,30 @@
 #![allow(clippy::significant_drop_tightening)]
 #![allow(missing_docs)]
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use legendre::{
     core::{
         driver::{Driver, DriverSet},
+        monte_carlo::path_grid,
         scheduler::SerialScheduler,
         simulation::Simulation,
-        state::{State, StateBuilder},
+        state::{FieldHandle, State, StateBuilder},
         storage::{DenseStorage, SystemAllocator},
     },
     discretization::finite_volume::FiniteVolume,
     geometry::{
         amr::{AmrGrid, BergerOliger, ClusterParams, GradientTagger, RegridPolicy, cluster},
-        cartesian::{CartesianGrid, fill_ghosts_mirror},
+        cartesian::{CartesianGrid, fill_ghosts_mirror, for_each_interior},
         grid::{BlockId, Grid},
     },
-    integrators::{EulerMaruyama, Integrator, RungeKutta4, Subcycling},
+    integrators::{EulerMaruyama, ForwardEuler, ImexEuler, Integrator, RungeKutta4, Subcycling},
     physics::{
+        market_making::{DepthTables, HjbMarketMaker, MarketMakerParams, MarketMakingEnsemble},
         model::{NoNoise, Wiener},
         phasefield::ModelC,
     },
 };
+use std::sync::Arc;
 
 const N: usize = 128;
 const H: f64 = 0.4;
@@ -276,9 +279,182 @@ fn amr(c: &mut Criterion) {
     });
 }
 
+// --- Market making: the HJB policy solve, the controlled path ensemble, and
+// the live quote lookup — the three latency surfaces of the strategy. ---
+
+const NU_CELLS: usize = 100;
+const NU_BLOCK: usize = 25;
+const HORIZON: f64 = 3.0;
+
+type HjbSim = Simulation<
+    CartesianGrid<1>,
+    (),
+    HjbMarketMaker,
+    ForwardEuler,
+    SerialScheduler,
+    SystemAllocator,
+>;
+type EnsembleSim = Simulation<
+    CartesianGrid<1>,
+    (),
+    MarketMakingEnsemble,
+    EulerMaruyama,
+    SerialScheduler,
+    SystemAllocator,
+>;
+
+fn nu_grid() -> CartesianGrid<1> {
+    let (lo, hi) = (0.001, 2.0);
+    CartesianGrid::new([NU_CELLS], [NU_BLOCK], [lo], [(hi - lo) / NU_CELLS as f64]).unwrap()
+}
+
+fn hjb_sim(params: MarketMakerParams) -> (HjbSim, f64) {
+    let sim = Simulation::new(
+        nu_grid(),
+        (),
+        HjbMarketMaker::new(params),
+        ForwardEuler,
+        SerialScheduler,
+        SystemAllocator,
+    );
+    let dt = sim.stable_dt().unwrap();
+    (sim, dt)
+}
+
+/// The value surface as `surface[q_index][ν_cell]`.
+fn capture(
+    grid: &CartesianGrid<1>,
+    state: &State<f64, DenseStorage<f64>>,
+    handles: &[FieldHandle<f64>],
+) -> Vec<Vec<f64>> {
+    handles
+        .iter()
+        .map(|&h| {
+            let mut col = Vec::new();
+            for b in 0..grid.num_blocks() {
+                let v = state.view(grid, BlockId(b as u32), h);
+                for_each_interior(grid.block_cells(), |idx| col.push(v.get(idx)));
+            }
+            col
+        })
+        .collect()
+}
+
+/// Solve the HJB to the horizon (setup only) and bake the optimal-quote tables.
+fn depth_tables(params: MarketMakerParams) -> DepthTables {
+    let (mut sim, dt) = hjb_sim(params);
+    let steps = (HORIZON / dt).ceil() as usize;
+    let handles = sim.model().handles().to_vec();
+    let mut taus = vec![0.0];
+    let mut surfaces = vec![capture(sim.grid(), sim.state(), &handles)];
+    for i in 0..steps {
+        sim.step(dt);
+        taus.push((i + 1) as f64 * dt);
+        surfaces.push(capture(sim.grid(), sim.state(), &handles));
+    }
+    DepthTables::build(&HjbMarketMaker::new(params), &nu_grid(), &taus, &surfaces)
+}
+
+fn ensemble_sim(params: MarketMakerParams, tables: Arc<DepthTables>) -> EnsembleSim {
+    let grid = path_grid(20_000, 4000).unwrap();
+    let mut sim = Simulation::new(
+        grid,
+        (),
+        MarketMakingEnsemble::new(params, tables, HORIZON),
+        EulerMaruyama { seed: 7 },
+        SerialScheduler,
+        SystemAllocator,
+    );
+    let model = sim.model().clone();
+    let (g, state) = sim.state_mut();
+    model.initialize(g, state, params.theta, 100.0);
+    sim
+}
+
+fn hjb_grid(cells: usize, block: usize) -> CartesianGrid<1> {
+    let (lo, hi) = (0.001, 2.0);
+    CartesianGrid::new([cells], [block], [lo], [(hi - lo) / cells as f64]).unwrap()
+}
+
+/// Full backward-time explicit HJB re-solve to the horizon (state reset to
+/// the zero terminal condition each iteration) — the policy-refresh latency.
+fn bench_hjb_solve(c: &mut Criterion, name: &str, cells: usize, block: usize) {
+    let mut sim = Simulation::new(
+        hjb_grid(cells, block),
+        (),
+        HjbMarketMaker::new(MarketMakerParams::default()),
+        ForwardEuler,
+        SerialScheduler,
+        SystemAllocator,
+    );
+    let dt = sim.stable_dt().unwrap();
+    let steps = (HORIZON / dt).ceil() as usize;
+    c.bench_function(name, |b| {
+        b.iter(|| {
+            sim.state_mut().1.fill_zero();
+            for _ in 0..steps {
+                sim.step(dt);
+            }
+        });
+    });
+}
+
+/// The same re-solve under the IMEX scheme (implicit ν operator, dν-free dt).
+fn bench_hjb_solve_imex(c: &mut Criterion, name: &str, cells: usize, block: usize) {
+    let mut sim = Simulation::new(
+        hjb_grid(cells, block),
+        (),
+        HjbMarketMaker::new(MarketMakerParams::default()),
+        ImexEuler,
+        SerialScheduler,
+        SystemAllocator,
+    );
+    let dt = sim.stable_dt().unwrap();
+    let steps = (HORIZON / dt).ceil() as usize;
+    c.bench_function(name, |b| {
+        b.iter(|| {
+            sim.state_mut().1.fill_zero();
+            for _ in 0..steps {
+                sim.step(dt);
+            }
+        });
+    });
+}
+
+fn market_making(c: &mut Criterion) {
+    let params = MarketMakerParams::default();
+
+    // Policy-refresh cost: one backward-time HJB step (a full re-solve is
+    // `steps` of these — the freshness bound when recalibrating intraday).
+    c.bench_function("mm/hjb/step", |b| {
+        let (mut sim, dt) = hjb_sim(params);
+        b.iter(|| sim.step(dt));
+    });
+
+    // Full re-solve latency, explicit forward Euler (dt ∝ dν²) vs the IMEX
+    // scheme (dν-independent dt): the policy-refresh speedup.
+    bench_hjb_solve(c, "mm/hjb/solve/explicit_n100", 100, 25);
+    bench_hjb_solve(c, "mm/hjb/solve/explicit_n200", 200, 25);
+    bench_hjb_solve_imex(c, "mm/hjb/solve/imex_n100", 100, 25);
+    bench_hjb_solve_imex(c, "mm/hjb/solve/imex_n200", 200, 25);
+
+    // Backtest throughput: one Euler–Maruyama step of the controlled ensemble.
+    c.bench_function("mm/ensemble/step", |b| {
+        let (_, dt) = hjb_sim(params);
+        let mut sim = ensemble_sim(params, Arc::new(depth_tables(params)));
+        b.iter(|| sim.step(dt));
+    });
+
+    // Live quote: the single lookup that turns (τ, ν, q) into (δᵇ, δˢ).
+    c.bench_function("mm/depth_tables/lookup", |b| {
+        let tables = depth_tables(params);
+        b.iter(|| black_box(tables.lookup(black_box(1.5), black_box(0.9), black_box(2))));
+    });
+}
+
 criterion_group! {
     name = benches;
     config = config();
-    targets = integrator_steps, primitives, amr
+    targets = integrator_steps, primitives, amr, market_making
 }
 criterion_main!(benches);
